@@ -347,6 +347,10 @@ class TunnelClient:
             github_app_pem = os.getenv("GITHUB_APP_PEM")
             github_api_endpoint = os.getenv("GITHUB_API_ENDPOINT", "https://api.github.com")
             
+            # Handle escaped newlines in PEM key
+            if github_app_pem and "\\n" in github_app_pem:
+                github_app_pem = github_app_pem.replace("\\n", "\n")
+
             if not github_app_id:
                 logger.error("GITHUB_APP_ID environment variable not set")
                 return False
