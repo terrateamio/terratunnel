@@ -45,7 +45,7 @@ COPY --from=builder /install /usr/local/lib/python3.11/site-packages
 COPY --from=builder /app/terratunnel /app/terratunnel
 
 # Set Python path to include the app directory
-ENV PYTHONPATH=/app:$PYTHONPATH
+ENV PYTHONPATH=/app
 WORKDIR /app
 
 # Switch to non-root user
