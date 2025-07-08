@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  # Terratunnel Server
+  terratunnel-server:
+    image: ghcr.io/terrateamio/terratunnel:latest
+    command: server --domain tunnel.example.com --github-only
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    environment:
+      - TERRATUNNEL_LOG_LEVEL=INFO
+    networks:
+      - terratunnel
+
+  # Terratunnel Client
+  terratunnel-client:
+    image: ghcr.io/terrateamio/terratunnel:latest
+    command: client --local-endpoint http://host.docker.internal:3000 --dashboard
+    ports:
+      - "8080:8080"  # Dashboard
+      - "8081:8081"  # API
+    restart: unless-stopped
+    environment:
+      - TERRATUNNEL_LOG_LEVEL=INFO
+      # Uncomment and set these for GitHub webhook integration
+      # - GITHUB_APP_ID=${GITHUB_APP_ID}
+      # - GITHUB_APP_PEM=${GITHUB_APP_PEM}
+      # - WEBHOOK_PATH=/webhook
+    networks:
+      - terratunnel
+    depends_on:
+      - terratunnel-server
+
+networks:
+  terratunnel:
+    driver: bridge

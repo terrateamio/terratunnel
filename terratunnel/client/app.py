@@ -1,0 +1,1220 @@
+import asyncio
+import logging
+import json
+import threading
+import signal
+import sys
+import os
+import time
+from datetime import datetime, timezone
+from typing import List, Dict, Optional
+from urllib.parse import urlparse
+import websockets
+import httpx
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+import uvicorn
+import jwt
+
+# Suppress uvicorn's shutdown errors
+logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
+
+
+logger = logging.getLogger("terratunnel-client")
+
+
+class TunnelClient:
+    def __init__(self, server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False):
+        self.server_url = server_url
+        self.local_endpoint = local_endpoint
+        self.assigned_hostname = None
+        self.subdomain = None
+        self.websocket = None
+        self.running = True
+        self.lock = threading.Lock()
+        self.dashboard = dashboard
+        self.dashboard_port = dashboard_port
+        self.api_port = api_port
+        self.update_github_webhook = update_github_webhook
+        self.webhook_history: List[Dict] = []
+        self.max_history = 100  # Keep last 100 webhooks
+        self.connection_start_time = None
+        
+        parsed = urlparse(server_url)
+        ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+        self.ws_url = f"{ws_scheme}://{parsed.netloc}/ws"
+        self.local_url = local_endpoint
+
+    async def connect(self):
+        try:
+            self.websocket = await websockets.connect(self.ws_url)
+            
+            # Send local endpoint information to server
+            endpoint_info = {
+                "type": "client_info",
+                "local_endpoint": self.local_endpoint
+            }
+            await self.websocket.send(json.dumps(endpoint_info))
+            
+            hostname_message = await self.websocket.recv()
+            hostname_data = json.loads(hostname_message)
+            
+            if hostname_data.get("type") == "hostname_assigned":
+                self.assigned_hostname = hostname_data.get("hostname")
+                self.subdomain = hostname_data.get("subdomain")
+                
+                with self.lock:
+                    self.running = True
+                    self.connection_start_time = datetime.now(timezone.utc)
+                
+                logger.info(f"Tunnel ready! Access your local server at: https://{self.assigned_hostname}")
+                logger.info(f"Connected to tunnel server with hostname: {self.assigned_hostname}")
+                
+                # Automatically update GitHub webhook URL if flag is enabled and environment variables are set
+                if self.update_github_webhook and os.getenv("GITHUB_APP_ID") and os.getenv("GITHUB_APP_PEM"):
+                    webhook_path = os.getenv("WEBHOOK_PATH", "/webhook")
+                    await self.update_github_webhook_url(webhook_path)
+                
+                return True
+            else:
+                logger.error("Did not receive hostname assignment from server")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to connect to tunnel server: {e}")
+            return False
+
+    def _record_webhook(self, request_data: dict, response_data: dict):
+        """Record webhook request and response for dashboard"""
+        if not self.dashboard:
+            return
+            
+        webhook_record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "method": request_data.get("method", "GET"),
+            "path": request_data.get("path", "/"),
+            "headers": request_data.get("headers", {}),
+            "query_params": request_data.get("query_params", {}),
+            "body": request_data.get("body", ""),
+            "response_status": response_data.get("status_code", 0),
+            "response_headers": response_data.get("headers", {}),
+            "response_body": response_data.get("body", "")
+        }
+        
+        with self.lock:
+            self.webhook_history.insert(0, webhook_record)  # Insert at beginning
+            if len(self.webhook_history) > self.max_history:
+                self.webhook_history.pop()  # Remove oldest
+
+    def _log_request(self, request_data: dict, response_data: dict):
+        """Log complete request and response details to console for user visibility"""
+        method = request_data.get("method", "GET")
+        path = request_data.get("path", "/")
+        status_code = response_data.get("status_code", 0)
+        
+        # Status indicators without emojis
+        if status_code >= 200 and status_code < 300:
+            status_indicator = "SUCCESS"
+        elif status_code >= 300 and status_code < 400:
+            status_indicator = "REDIRECT"
+        elif status_code >= 400 and status_code < 500:
+            status_indicator = "CLIENT_ERROR"
+        else:
+            status_indicator = "SERVER_ERROR"
+        
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        # Main request line
+        query_params = request_data.get("query_params", {})
+        query_str = ""
+        if query_params:
+            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+        
+        logger.info(f"[{timestamp}] {status_indicator} {method} {path}{query_str} -> {status_code}")
+        
+        # Request headers
+        request_headers = request_data.get("headers", {})
+        if request_headers:
+            logger.info("  Request Headers:")
+            for key, value in request_headers.items():
+                # Truncate very long header values
+                display_value = value[:200] + "..." if len(str(value)) > 200 else value
+                logger.info(f"    {key}: {display_value}")
+        
+        # Request body
+        request_body = request_data.get("body", "")
+        if request_body:
+            logger.info("  Request Body:")
+            # Pretty print JSON if possible
+            try:
+                import json
+                if request_headers.get("content-type", "").startswith("application/json"):
+                    parsed = json.loads(request_body)
+                    formatted = json.dumps(parsed, indent=2)
+                    # Limit body size in logs
+                    if len(formatted) > 1000:
+                        lines = formatted.split('\n')
+                        if len(lines) > 20:
+                            truncated = '\n'.join(lines[:20]) + f"\n    ... ({len(lines) - 20} more lines)"
+                        else:
+                            truncated = formatted[:1000] + "..."
+                        logger.info(f"    {truncated}")
+                    else:
+                        for line in formatted.split('\n'):
+                            logger.info(f"    {line}")
+                else:
+                    # Non-JSON body
+                    if len(request_body) > 500:
+                        logger.info(f"    {request_body[:500]}...")
+                    else:
+                        logger.info(f"    {request_body}")
+            except:
+                # Fallback for invalid JSON or other issues
+                if len(request_body) > 500:
+                    logger.info(f"    {request_body[:500]}...")
+                else:
+                    logger.info(f"    {request_body}")
+        
+        # Response headers
+        response_headers = response_data.get("headers", {})
+        if response_headers:
+            logger.info("  Response Headers:")
+            for key, value in response_headers.items():
+                # Truncate very long header values
+                display_value = value[:200] + "..." if len(str(value)) > 200 else value
+                logger.info(f"    {key}: {display_value}")
+        
+        # Response body
+        response_body = response_data.get("body", "")
+        if response_body:
+            logger.info("  Response Body:")
+            # Pretty print JSON if possible
+            try:
+                import json
+                if response_headers.get("content-type", "").startswith("application/json"):
+                    parsed = json.loads(response_body)
+                    formatted = json.dumps(parsed, indent=2)
+                    # Limit body size in logs
+                    if len(formatted) > 1000:
+                        lines = formatted.split('\n')
+                        if len(lines) > 20:
+                            truncated = '\n'.join(lines[:20]) + f"\n    ... ({len(lines) - 20} more lines)"
+                        else:
+                            truncated = formatted[:1000] + "..."
+                        logger.info(f"    {truncated}")
+                    else:
+                        for line in formatted.split('\n'):
+                            logger.info(f"    {line}")
+                else:
+                    # Non-JSON body
+                    if len(response_body) > 500:
+                        logger.info(f"    {response_body[:500]}...")
+                    else:
+                        logger.info(f"    {response_body}")
+            except:
+                # Fallback for invalid JSON or other issues
+                if len(response_body) > 500:
+                    logger.info(f"    {response_body[:500]}...")
+                else:
+                    logger.info(f"    {response_body}")
+        
+        # Add separator line for readability
+        logger.info("  " + "-" * 80)
+
+    async def handle_request(self, request_data: dict) -> dict:
+        try:
+            method = request_data.get("method", "GET")
+            path = request_data.get("path", "/")
+            headers = request_data.get("headers", {})
+            query_params = request_data.get("query_params", {})
+            body = request_data.get("body", "")
+            
+            url = f"{self.local_url}{path}"
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=query_params,
+                    content=body
+                )
+                
+                response_data = {
+                    "status_code": response.status_code,
+                    "headers": dict(response.headers),
+                    "body": response.text
+                }
+                
+                # Log request details for user visibility
+                self._log_request(request_data, response_data)
+                
+                # Record webhook for dashboard
+                self._record_webhook(request_data, response_data)
+                
+                return response_data
+                
+        except Exception as e:
+            logger.error(f"Error handling local request: {e}")
+            error_response = {
+                "status_code": 500,
+                "headers": {},
+                "body": f"Internal server error: {str(e)}"
+            }
+            
+            # Log error request
+            self._log_request(request_data, error_response)
+            
+            # Record error for dashboard too
+            self._record_webhook(request_data, error_response)
+            
+            return error_response
+
+    async def listen(self):
+        while self.running:
+            try:
+                if not self.websocket:
+                    break
+                
+                # Use timeout to make recv() interruptible
+                try:
+                    message = await asyncio.wait_for(self.websocket.recv(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                    
+                request_data = json.loads(message)
+                
+                if request_data.get("type") == "keepalive":
+                    await self.websocket.send(json.dumps({"type": "keepalive_ack"}))
+                    continue
+                
+                # Handle HTTP request
+                response_data = await self.handle_request(request_data)
+                
+                # Include request_id in response if present
+                if request_data.get("request_id"):
+                    response_data["request_id"] = request_data["request_id"]
+                
+                await self.websocket.send(json.dumps(response_data))
+                
+            except websockets.exceptions.ConnectionClosed:
+                logger.info("WebSocket connection closed")
+                break
+            except Exception as e:
+                logger.error(f"Error in message loop: {e}")
+                break
+        
+        with self.lock:
+            self.running = False
+
+    async def run(self):
+        while self.running:
+            if await self.connect():
+                try:
+                    await self.listen()
+                except Exception as e:
+                    logger.error(f"Error in client loop: {e}")
+            
+            if not self.running:
+                break
+                
+            logger.info("Reconnecting in 5 seconds...")
+            # Use shorter sleep intervals to be more responsive to shutdown
+            for _ in range(50):  # 5 seconds total, checking every 0.1 seconds
+                if not self.running:
+                    break
+                await asyncio.sleep(0.1)
+
+    def stop(self):
+        with self.lock:
+            self.running = False
+    
+    async def stop_async(self):
+        self.stop()
+        if self.websocket:
+            try:
+                await self.websocket.close()
+            except Exception:
+                pass
+
+    async def update_github_webhook_url(self, webhook_path: str = "/webhook"):
+        """Update GitHub application webhook URL with the tunnel endpoint"""
+        try:
+            logger.info("Updating the GitHub application webhook url")
+            
+            # Get required environment variables
+            github_app_id = os.getenv("GITHUB_APP_ID")
+            github_app_pem = os.getenv("GITHUB_APP_PEM")
+            github_api_endpoint = os.getenv("GITHUB_API_ENDPOINT", "https://api.github.com")
+            
+            if not github_app_id:
+                logger.error("GITHUB_APP_ID environment variable not set")
+                return False
+                
+            if not github_app_pem:
+                logger.error("GITHUB_APP_PEM environment variable not set")
+                return False
+                
+            if not self.assigned_hostname:
+                logger.error("No tunnel hostname assigned yet")
+                return False
+            
+            # Construct the webhook URL using tunnel address
+            webhook_url = f"https://{self.assigned_hostname}{webhook_path}"
+            logger.info(f"Setting webhook URL to: {webhook_url}")
+            
+            # Create JWT payload with issue and expiry time
+            current_time = int(time.time())
+            jwt_payload = {
+                "iat": current_time,
+                "exp": current_time + 300,  # 5 minutes
+                "iss": github_app_id
+            }
+            
+            # Encode the JWT using the private key
+            jwt_token = jwt.encode(jwt_payload, github_app_pem, algorithm="RS256")
+            
+            # Set request headers with JWT token
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {jwt_token}",
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "Terratunnel/1.0"
+            }
+            
+            # Define payload with new webhook configuration
+            webhook_payload = {
+                "content_type": "json",
+                "url": webhook_url
+            }
+            
+            # Send PATCH request to GitHub API to update webhook
+            async with httpx.AsyncClient() as client:
+                response = await client.patch(
+                    f"{github_api_endpoint}/app/hook/config",
+                    json=webhook_payload,
+                    headers=headers,
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    logger.info("GitHub webhook URL updated successfully")
+                    logger.info(f"Response: {response.text}")
+                    return True
+                else:
+                    logger.error(f"Failed to update GitHub webhook URL: {response.status_code}")
+                    logger.error(f"Response: {response.text}")
+                    return False
+                    
+        except jwt.InvalidKeyError:
+            logger.error("Invalid GitHub App private key format")
+            return False
+        except jwt.PyJWTError as e:
+            logger.error(f"JWT error: {e}")
+            return False
+        except httpx.RequestError as e:
+            logger.error(f"HTTP request error: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error updating GitHub webhook URL: {e}")
+            return False
+
+    def create_dashboard_app(self) -> FastAPI:
+        """Create FastAPI dashboard application"""
+        dashboard_app = FastAPI(title="Terratunnel Dashboard")
+        
+        @dashboard_app.get("/", response_class=HTMLResponse)
+        async def dashboard():
+            return self._generate_dashboard_html()
+        
+        @dashboard_app.get("/api/webhooks")
+        async def get_webhooks():
+            with self.lock:
+                return {
+                    "webhooks": self.webhook_history,
+                    "total": len(self.webhook_history),
+                    "tunnel_hostname": self.assigned_hostname
+                }
+        
+        @dashboard_app.get("/api/status")
+        async def get_status():
+            return {
+                "running": self.running,
+                "tunnel_hostname": self.assigned_hostname,
+                "local_endpoint": self.local_endpoint,
+                "webhook_count": len(self.webhook_history)
+            }
+        
+        @dashboard_app.post("/api/retry/{webhook_index}")
+        async def retry_webhook(webhook_index: int):
+            try:
+                with self.lock:
+                    if webhook_index < 0 or webhook_index >= len(self.webhook_history):
+                        return {"success": False, "error": "Invalid webhook index"}
+                    
+                    webhook = self.webhook_history[webhook_index]
+                
+                # Reconstruct the original request data
+                request_data = {
+                    "method": webhook["method"],
+                    "path": webhook["path"],
+                    "headers": webhook["headers"],
+                    "query_params": webhook["query_params"],
+                    "body": webhook["body"]
+                }
+                
+                # Retry the request
+                response_data = await self.handle_request(request_data)
+                
+                return {
+                    "success": True,
+                    "original_status": webhook["response_status"],
+                    "new_status": response_data["status_code"],
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+                
+            except Exception as e:
+                logger.error(f"Error retrying webhook {webhook_index}: {e}")
+                return {"success": False, "error": str(e)}
+        
+        return dashboard_app
+    
+    def create_api_app(self) -> FastAPI:
+        """Create simple JSON API application"""
+        api_app = FastAPI(title="Terratunnel Client API", version="1.0.0")
+        
+        @api_app.get("/status")
+        async def get_status():
+            """Get current client status"""
+            with self.lock:
+                uptime_seconds = None
+                if self.connection_start_time:
+                    uptime_seconds = (datetime.now(timezone.utc) - self.connection_start_time).total_seconds()
+                
+                return {
+                    "running": self.running,
+                    "connected": self.assigned_hostname is not None,
+                    "tunnel_hostname": self.assigned_hostname,
+                    "local_endpoint": self.local_endpoint,
+                    "server_url": self.server_url,
+                    "webhook_count": len(self.webhook_history),
+                    "uptime_seconds": uptime_seconds,
+                    "connection_start_time": self.connection_start_time.isoformat() if self.connection_start_time else None
+                }
+        
+        @api_app.get("/webhooks")
+        async def get_webhooks(limit: int = 10):
+            """Get recent webhooks"""
+            with self.lock:
+                limited_webhooks = self.webhook_history[:limit] if limit > 0 else self.webhook_history
+                return {
+                    "webhooks": limited_webhooks,
+                    "total_count": len(self.webhook_history),
+                    "limit": limit
+                }
+        
+        @api_app.get("/webhooks/stats")
+        async def get_webhook_stats():
+            """Get webhook statistics"""
+            with self.lock:
+                if not self.webhook_history:
+                    return {
+                        "total_count": 0,
+                        "status_codes": {},
+                        "methods": {},
+                        "latest_webhook": None
+                    }
+                
+                # Count status codes and methods
+                status_codes = {}
+                methods = {}
+                
+                for webhook in self.webhook_history:
+                    status = webhook.get("response_status", 0)
+                    method = webhook.get("method", "UNKNOWN")
+                    
+                    status_codes[str(status)] = status_codes.get(str(status), 0) + 1
+                    methods[method] = methods.get(method, 0) + 1
+                
+                return {
+                    "total_count": len(self.webhook_history),
+                    "status_codes": status_codes,
+                    "methods": methods,
+                    "latest_webhook": self.webhook_history[0] if self.webhook_history else None
+                }
+        
+        @api_app.get("/health")
+        async def health_check():
+            """Simple health check"""
+            return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+        
+        return api_app
+    
+    def _generate_dashboard_html(self) -> str:
+        """Generate HTML dashboard"""
+        return '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Terratunnel Dashboard</title>
+    <style>
+        * { box-sizing: border-box; }
+        
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; 
+            margin: 0; 
+            padding: 20px; 
+            background: #f8f9fa;
+            min-height: 100vh;
+            color: #212529;
+            line-height: 1.5;
+        }
+        
+        .container { 
+            max-width: 1200px; 
+            margin: 0 auto; 
+        }
+        
+        .header { 
+            background: white; 
+            padding: 2rem; 
+            border-radius: 8px; 
+            margin-bottom: 1.5rem; 
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            border: 1px solid #dee2e6;
+        }
+        
+        .header h1 { 
+            margin: 0 0 1.5rem 0; 
+            font-size: 2rem; 
+            font-weight: 600; 
+            color: #212529;
+        }
+        
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        .status-item {
+            background: #f8f9fa;
+            padding: 1rem;
+            border-radius: 6px;
+            border: 1px solid #e9ecef;
+        }
+        
+        .status-item strong {
+            display: block;
+            font-size: 0.875rem;
+            color: #6c757d;
+            margin-bottom: 0.25rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-weight: 500;
+        }
+        
+        .status-value {
+            font-size: 1rem;
+            font-weight: 600;
+            color: #212529;
+        }
+        
+        .status-connected { color: #198754; }
+        .status-disconnected { color: #dc3545; }
+        
+        .controls {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+        }
+        
+        .refresh-btn { 
+            background: #0d6efd; 
+            color: white; 
+            border: none; 
+            padding: 0.5rem 1rem; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            font-weight: 500;
+            font-size: 0.875rem;
+            transition: background-color 0.15s ease;
+        }
+        
+        .refresh-btn:hover { 
+            background: #0b5ed7;
+        }
+        
+        .webhook-list { 
+            background: white; 
+            padding: 2rem; 
+            border-radius: 8px; 
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            border: 1px solid #dee2e6;
+        }
+        
+        .webhook-list h2 {
+            margin: 0 0 1.5rem 0;
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #212529;
+        }
+        
+        .webhook-item { 
+            background: white;
+            border: 1px solid #dee2e6; 
+            margin-bottom: 1rem; 
+            border-radius: 6px; 
+            overflow: hidden;
+            transition: box-shadow 0.15s ease;
+        }
+        
+        .webhook-item:hover {
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .webhook-header { 
+            background: #f8f9fa; 
+            padding: 1rem; 
+            cursor: pointer;
+            transition: background-color 0.15s ease;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+        
+        .webhook-header:hover {
+            background: #e9ecef;
+        }
+        
+        .webhook-main-info {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex: 1;
+            min-width: 0;
+        }
+        
+        .webhook-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        
+        .webhook-details { 
+            padding: 1.5rem; 
+            display: none; 
+            background: #fafbfc;
+            border-top: 1px solid #dee2e6;
+        }
+        
+        .method { 
+            padding: 0.25rem 0.75rem; 
+            border-radius: 4px; 
+            color: white; 
+            font-weight: 600; 
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            min-width: 60px;
+            text-align: center;
+        }
+        
+        .method.GET { background: #198754; }
+        .method.POST { background: #0d6efd; }
+        .method.PUT { background: #fd7e14; }
+        .method.DELETE { background: #dc3545; }
+        .method.PATCH { background: #6f42c1; }
+        
+        .webhook-path {
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+            font-weight: 500;
+            font-size: 0.875rem;
+            color: #495057;
+            word-break: break-all;
+        }
+        
+        .status-badge {
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-weight: 600;
+            font-size: 0.75rem;
+            min-width: 50px;
+            text-align: center;
+        }
+        
+        .status-200 { background: #d1e7dd; color: #0f5132; }
+        .status-300 { background: #fff3cd; color: #664d03; }
+        .status-400 { background: #f8d7da; color: #58151c; }
+        .status-500 { background: #e2e3f0; color: #41464b; }
+        
+        .timestamp { 
+            color: #6c757d; 
+            font-size: 0.75rem; 
+            font-weight: 400;
+            width: 100%;
+            margin-top: 0.5rem;
+        }
+        
+        .retry-btn { 
+            background: #198754; 
+            color: white; 
+            border: none; 
+            padding: 0.375rem 0.75rem; 
+            border-radius: 4px; 
+            cursor: pointer; 
+            font-size: 0.75rem; 
+            font-weight: 500;
+            transition: background-color 0.15s ease;
+        }
+        
+        .retry-btn:hover { 
+            background: #157347;
+        }
+        
+        .retry-btn:disabled { 
+            background: #6c757d; 
+            cursor: not-allowed; 
+        }
+        
+        .retry-status { 
+            margin: 1rem 0; 
+            padding: 0.75rem; 
+            border-radius: 6px; 
+            font-size: 0.875rem; 
+        }
+        
+        .retry-success { 
+            background: #d1e7dd; 
+            color: #0f5132; 
+            border: 1px solid #a3cfbb; 
+        }
+        
+        .retry-error { 
+            background: #f8d7da; 
+            color: #58151c; 
+            border: 1px solid #f1aeb5; 
+        }
+        
+        .no-webhooks { 
+            text-align: center; 
+            color: #6c757d; 
+            padding: 3rem 1rem;
+            font-size: 1rem;
+        }
+        
+        .section-title {
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: #495057;
+            margin: 1.5rem 0 0.75rem 0;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        pre { 
+            background: #f1f3f4; 
+            padding: 1rem; 
+            border-radius: 6px; 
+            overflow-x: auto; 
+            white-space: pre-wrap; 
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+            font-size: 0.8125rem;
+            line-height: 1.4;
+            border: 1px solid #dee2e6;
+            margin: 0.5rem 0;
+        }
+        
+        .expand-indicator {
+            transition: transform 0.15s ease;
+            font-size: 0.75rem;
+            color: #6c757d;
+        }
+        
+        .webhook-header.expanded .expand-indicator {
+            transform: rotate(90deg);
+        }
+        
+        @media (max-width: 768px) {
+            body { padding: 1rem; }
+            .header { padding: 1.5rem; }
+            .webhook-list { padding: 1.5rem; }
+            .webhook-header { padding: 1rem; flex-direction: column; align-items: flex-start; }
+            .webhook-main-info { width: 100%; }
+            .webhook-actions { width: 100%; justify-content: flex-start; }
+            .status-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Terratunnel Dashboard</h1>
+            <div class="status-grid" id="status">Loading...</div>
+            <div class="controls">
+                <button class="refresh-btn" onclick="loadWebhooks()">Refresh</button>
+            </div>
+        </div>
+        
+        <div class="webhook-list">
+            <h2>Webhook History</h2>
+            <div id="webhooks">Loading webhooks...</div>
+        </div>
+    </div>
+
+    <script>
+        let expandedItems = new Set();
+        let lastWebhookCount = 0;
+
+        async function loadStatus() {
+            console.log('Loading status...');
+            try {
+                const response = await fetch('/api/status');
+                console.log('Status response:', response.status);
+                const status = await response.json();
+                console.log('Status data:', status);
+                document.getElementById('status').innerHTML = `
+                    <div class="status-item">
+                        <strong>Connection Status</strong>
+                        <div class="status-value ${status.running ? 'status-connected' : 'status-disconnected'}">
+                            ${status.running ? 'Connected' : 'Disconnected'}
+                        </div>
+                    </div>
+                    <div class="status-item">
+                        <strong>Tunnel URL</strong>
+                        <div class="status-value">
+                            ${status.tunnel_hostname ? 'https://' + status.tunnel_hostname : 'Not assigned'}
+                        </div>
+                    </div>
+                    <div class="status-item">
+                        <strong>Local Endpoint</strong>
+                        <div class="status-value">${status.local_endpoint}</div>
+                    </div>
+                    <div class="status-item">
+                        <strong>Total Webhooks</strong>
+                        <div class="status-value">${status.webhook_count}</div>
+                    </div>
+                `;
+            } catch (error) {
+                console.error('Error loading status:', error);
+                document.getElementById('status').innerHTML = '<div class="status-item"><strong>Error loading status</strong></div>';
+            }
+        }
+
+        async function loadWebhooks() {
+            console.log('Loading webhooks...');
+            try {
+                const response = await fetch('/api/webhooks');
+                console.log('Webhooks response:', response.status);
+                const data = await response.json();
+                console.log('Webhooks data:', data);
+                const webhooksDiv = document.getElementById('webhooks');
+                
+                if (data.webhooks.length === 0) {
+                    webhooksDiv.innerHTML = '<div class="no-webhooks">No webhooks received yet<br><small>Webhook requests will appear here as they come in</small></div>';
+                    expandedItems.clear();
+                    lastWebhookCount = 0;
+                    return;
+                }
+                
+                // Only re-render if webhook count changed
+                if (data.webhooks.length !== lastWebhookCount) {
+                    webhooksDiv.innerHTML = data.webhooks.map((webhook, index) => `
+                        <div class="webhook-item">
+                            <div class="webhook-header ${expandedItems.has(index) ? 'expanded' : ''}" onclick="toggleDetails(${index})">
+                                <div class="webhook-main-info">
+                                    <span class="method ${webhook.method}">${webhook.method}</span>
+                                    <div class="webhook-path">${webhook.path}</div>
+                                    <span class="expand-indicator">▶</span>
+                                </div>
+                                <div class="webhook-actions">
+                                    <span class="status-badge status-${Math.floor(webhook.response_status / 100)}00">
+                                        ${webhook.response_status}
+                                    </span>
+                                    <button class="retry-btn" onclick="retryWebhook(${index}, event)" id="retry-btn-${index}">
+                                        Retry
+                                    </button>
+                                </div>
+                                <div class="timestamp">${new Date(webhook.timestamp).toLocaleString()}</div>
+                            </div>
+                            <div class="webhook-details" id="details-${index}" style="display: ${expandedItems.has(index) ? 'block' : 'none'}">
+                                <div id="retry-status-${index}"></div>
+                                
+                                <div class="section-title">Request Headers</div>
+                                <pre>${JSON.stringify(webhook.headers, null, 2)}</pre>
+                                
+                                ${webhook.query_params && Object.keys(webhook.query_params).length > 0 ? `
+                                <div class="section-title">Query Parameters</div>
+                                <pre>${JSON.stringify(webhook.query_params, null, 2)}</pre>
+                                ` : ''}
+                                
+                                ${webhook.body ? `
+                                <div class="section-title">Request Body</div>
+                                <pre>${webhook.body}</pre>
+                                ` : ''}
+                                
+                                <div class="section-title">Response Headers</div>
+                                <pre>${JSON.stringify(webhook.response_headers, null, 2)}</pre>
+                                
+                                ${webhook.response_body ? `
+                                <div class="section-title">Response Body</div>
+                                <pre>${webhook.response_body.substring(0, 1000)}${webhook.response_body.length > 1000 ? '\\n\\n... (truncated)' : ''}</pre>
+                                ` : ''}
+                            </div>
+                        </div>
+                    `).join('');
+                    
+                    lastWebhookCount = data.webhooks.length;
+                }
+                
+                await loadStatus();
+            } catch (error) {
+                console.error('Error loading webhooks:', error);
+                document.getElementById('webhooks').innerHTML = '<div class="no-webhooks">Error loading webhooks</div>';
+            }
+        }
+        
+        function toggleDetails(index) {
+            const details = document.getElementById(`details-${index}`);
+            const header = details.previousElementSibling;
+            
+            if (expandedItems.has(index)) {
+                details.style.display = 'none';
+                header.classList.remove('expanded');
+                expandedItems.delete(index);
+            } else {
+                details.style.display = 'block';
+                header.classList.add('expanded');
+                expandedItems.add(index);
+            }
+        }
+        
+        async function retryWebhook(index, event) {
+            // Prevent the click from triggering toggleDetails
+            event.stopPropagation();
+            
+            const retryBtn = document.getElementById(`retry-btn-${index}`);
+            const retryStatus = document.getElementById(`retry-status-${index}`);
+            
+            // Disable button and show loading state
+            retryBtn.disabled = true;
+            retryBtn.textContent = 'Retrying...';
+            retryStatus.innerHTML = '';
+            
+            try {
+                const response = await fetch(`/api/retry/${index}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    const statusChange = result.original_status !== result.new_status ? 
+                        ` (${result.original_status} → ${result.new_status})` : 
+                        ` (${result.new_status})`;
+                    
+                    retryStatus.innerHTML = `
+                        <div class="retry-status retry-success">
+                            ✓ Webhook retried successfully${statusChange}
+                            <br><small>Retried at: ${new Date(result.timestamp).toLocaleString()}</small>
+                        </div>
+                    `;
+                    
+                    // Auto-expand details to show retry status
+                    if (!expandedItems.has(index)) {
+                        expandedItems.add(index);
+                        document.getElementById(`details-${index}`).style.display = 'block';
+                    }
+                    
+                } else {
+                    retryStatus.innerHTML = `
+                        <div class="retry-status retry-error">
+                            ✗ Retry failed: ${result.error}
+                        </div>
+                    `;
+                }
+                
+            } catch (error) {
+                console.error('Error retrying webhook:', error);
+                retryStatus.innerHTML = `
+                    <div class="retry-status retry-error">
+                        ✗ Retry failed: ${error.message}
+                    </div>
+                `;
+            } finally {
+                // Re-enable button
+                retryBtn.disabled = false;
+                retryBtn.textContent = 'Retry';
+            }
+        }
+        
+        // Add global error handler for better debugging
+        window.addEventListener('error', function(e) {
+            console.error('Global error:', e.error);
+            console.error('File:', e.filename, 'Line:', e.lineno, 'Column:', e.colno);
+        });
+        
+        // Add unhandled promise rejection handler
+        window.addEventListener('unhandledrejection', function(e) {
+            console.error('Unhandled promise rejection:', e.reason);
+        });
+        
+        // Load data on page load
+        console.log('Dashboard initializing...');
+        loadWebhooks();
+        
+        // Auto-refresh every 5 seconds
+        setInterval(function() {
+            console.log('Auto-refreshing webhooks...');
+            loadWebhooks();
+        }, 5000);
+    </script>
+</body>
+</html>
+        '''
+
+
+async def main_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False):
+    logger.info(f"Starting tunnel client - local endpoint: {local_endpoint}")
+    
+    client = TunnelClient(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook)
+    servers = []
+    server_tasks = []
+    
+    # Set up signal handlers
+    shutdown_event = asyncio.Event()
+    force_exit = False
+    
+    def signal_handler(signum, frame):
+        nonlocal force_exit
+        if force_exit:
+            # Second Ctrl+C, force immediate exit
+            logger.info("Force exit!")
+            os._exit(1)
+        
+        force_exit = True
+        logger.info("Shutting down... (Press Ctrl+C again to force quit)")
+        
+        # Stop the client
+        client.stop()
+        
+        # Stop all servers
+        for server in servers:
+            server.should_exit = True
+        
+        # Set shutdown event
+        shutdown_event.set()
+        
+        # Force exit after 1 second
+        def force_shutdown():
+            logger.warning("Shutdown timeout, forcing exit...")
+            os._exit(1)
+        
+        import threading
+        timer = threading.Timer(1.0, force_shutdown)
+        timer.daemon = True
+        timer.start()
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        # Start dashboard and API servers if enabled
+        if dashboard or True:  # Always start API server
+            api_app = client.create_api_app()
+            api_config = uvicorn.Config(
+                app=api_app,
+                host="0.0.0.0",
+                port=api_port,
+                log_level="warning",
+                loop="asyncio",
+                access_log=False
+            )
+            api_server = uvicorn.Server(api_config)
+            servers.append(api_server)
+            
+            if dashboard:
+                dashboard_app = client.create_dashboard_app()
+                dashboard_config = uvicorn.Config(
+                    app=dashboard_app,
+                    host="0.0.0.0",
+                    port=dashboard_port,
+                    log_level="warning",
+                    loop="asyncio",
+                    access_log=False
+                )
+                dashboard_server = uvicorn.Server(dashboard_config)
+                servers.append(dashboard_server)
+        
+        # Start servers in background tasks
+        server_tasks = []
+        for server in servers:
+            # Disable uvicorn's signal handlers
+            server.install_signal_handlers = lambda: None
+            task = asyncio.create_task(server.serve())
+            server_tasks.append(task)
+        
+        if dashboard:
+            logger.info(f"Dashboard available at: http://localhost:{dashboard_port}")
+        logger.info(f"API available at: http://localhost:{api_port}")
+        
+        # Run the main client with shutdown monitoring
+        client_task = asyncio.create_task(client.run())
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
+        
+        # Wait for either client to finish or shutdown signal
+        done, pending = await asyncio.wait(
+            {client_task, shutdown_task},
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        
+        # Cancel the other task
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+    finally:
+        logger.info("Cleaning up...")
+        client.stop()
+        
+        # Stop servers gracefully
+        for server in servers:
+            server.should_exit = True
+        
+        # Give servers a moment to shutdown cleanly
+        await asyncio.sleep(0.1)
+        
+        # Cancel any remaining server tasks
+        for task in server_tasks:
+            if not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=0.5)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+        
+        if client.websocket:
+            try:
+                await client.websocket.close()
+            except:
+                pass
+
+
+def run_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False):
+    try:
+        asyncio.run(main_client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook))
+    except KeyboardInterrupt:
+        logger.info("Stopping tunnel client...")
+    except Exception as e:
+        logger.error(f"Client error: {e}")
+        sys.exit(1)
