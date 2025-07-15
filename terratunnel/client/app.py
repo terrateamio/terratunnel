@@ -39,6 +39,11 @@ class TunnelClient:
         self.webhook_history: List[Dict] = []
         self.max_history = 100  # Keep last 100 webhooks
         self.connection_start_time = None
+        self.last_keepalive = None
+        self.keepalive_timeout = 35  # Server sends keepalive every 30s, timeout after 35s
+        self.reconnect_delay = 1  # Initial reconnect delay in seconds
+        self.max_reconnect_delay = 60  # Maximum reconnect delay
+        self.reconnect_attempts = 0
         
         parsed = urlparse(server_url)
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
@@ -47,7 +52,15 @@ class TunnelClient:
 
     async def connect(self):
         try:
-            self.websocket = await websockets.connect(self.ws_url)
+            logger.info(f"Connecting to tunnel server at {self.ws_url}...")
+            
+            # Add connection timeout and ping interval for better connection health monitoring
+            self.websocket = await websockets.connect(
+                self.ws_url,
+                ping_interval=10,  # Send ping every 10 seconds
+                ping_timeout=20,   # Wait 20 seconds for pong
+                close_timeout=10   # Wait 10 seconds for close handshake
+            )
             
             # Send local endpoint information to server
             endpoint_info = {
@@ -56,7 +69,14 @@ class TunnelClient:
             }
             await self.websocket.send(json.dumps(endpoint_info))
             
-            hostname_message = await self.websocket.recv()
+            # Wait for hostname assignment with timeout
+            try:
+                hostname_message = await asyncio.wait_for(self.websocket.recv(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.error("Timeout waiting for hostname assignment from server")
+                await self.websocket.close()
+                return False
+                
             hostname_data = json.loads(hostname_message)
             
             if hostname_data.get("type") == "hostname_assigned":
@@ -66,6 +86,9 @@ class TunnelClient:
                 with self.lock:
                     self.running = True
                     self.connection_start_time = datetime.now(timezone.utc)
+                    self.last_keepalive = time.time()
+                    self.reconnect_delay = 1  # Reset reconnect delay on successful connection
+                    self.reconnect_attempts = 0
                 
                 logger.info(f"Tunnel ready! Access your local server at: https://{self.assigned_hostname}")
                 logger.info(f"Connected to tunnel server with hostname: {self.assigned_hostname}")
@@ -78,10 +101,23 @@ class TunnelClient:
                 return True
             else:
                 logger.error("Did not receive hostname assignment from server")
+                if self.websocket:
+                    await self.websocket.close()
                 return False
                 
+        except websockets.exceptions.InvalidURI:
+            logger.error(f"Invalid WebSocket URL: {self.ws_url}")
+            return False
+        except websockets.exceptions.WebSocketException as e:
+            logger.error(f"WebSocket error during connection: {e}")
+            return False
         except Exception as e:
             logger.error(f"Failed to connect to tunnel server: {e}")
+            if self.websocket:
+                try:
+                    await self.websocket.close()
+                except:
+                    pass
             return False
 
     def _record_webhook(self, request_data: dict, response_data: dict):
@@ -271,60 +307,112 @@ class TunnelClient:
             
             return error_response
 
-    async def listen(self):
-        while self.running:
+    async def monitor_keepalive(self):
+        """Monitor keepalive messages and detect connection failures"""
+        while self.running and self.websocket:
             try:
-                if not self.websocket:
-                    break
+                await asyncio.sleep(5)  # Check every 5 seconds
                 
-                # Use timeout to make recv() interruptible
-                try:
-                    message = await asyncio.wait_for(self.websocket.recv(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-                    
-                request_data = json.loads(message)
-                
-                if request_data.get("type") == "keepalive":
-                    await self.websocket.send(json.dumps({"type": "keepalive_ack"}))
-                    continue
-                
-                # Handle HTTP request
-                response_data = await self.handle_request(request_data)
-                
-                # Include request_id in response if present
-                if request_data.get("request_id"):
-                    response_data["request_id"] = request_data["request_id"]
-                
-                await self.websocket.send(json.dumps(response_data))
-                
-            except websockets.exceptions.ConnectionClosed:
-                logger.info("WebSocket connection closed")
-                break
+                with self.lock:
+                    if self.last_keepalive and time.time() - self.last_keepalive > self.keepalive_timeout:
+                        logger.warning(f"No keepalive received for {self.keepalive_timeout} seconds, connection may be dead")
+                        # Force close the websocket to trigger reconnection
+                        if self.websocket:
+                            await self.websocket.close()
+                        break
             except Exception as e:
-                logger.error(f"Error in message loop: {e}")
+                logger.error(f"Error in keepalive monitor: {e}")
                 break
+
+    async def listen(self):
+        # Start keepalive monitor in background
+        monitor_task = asyncio.create_task(self.monitor_keepalive())
         
-        with self.lock:
-            self.running = False
+        try:
+            while self.running:
+                try:
+                    if not self.websocket:
+                        break
+                    
+                    # Use timeout to make recv() interruptible
+                    try:
+                        message = await asyncio.wait_for(self.websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                        
+                    request_data = json.loads(message)
+                    
+                    if request_data.get("type") == "keepalive":
+                        await self.websocket.send(json.dumps({"type": "keepalive_ack"}))
+                        with self.lock:
+                            self.last_keepalive = time.time()
+                        continue
+                    
+                    # Handle HTTP request
+                    response_data = await self.handle_request(request_data)
+                    
+                    # Include request_id in response if present
+                    if request_data.get("request_id"):
+                        response_data["request_id"] = request_data["request_id"]
+                    
+                    await self.websocket.send(json.dumps(response_data))
+                    
+                except websockets.exceptions.ConnectionClosed:
+                    logger.info("WebSocket connection closed")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in message loop: {e}")
+                    break
+        finally:
+            # Cancel the monitor task
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
+            
+            with self.lock:
+                self.websocket = None
+                # Clear connection-related state
+                self.connection_start_time = None
+                self.last_keepalive = None
 
     async def run(self):
         while self.running:
-            if await self.connect():
-                try:
-                    await self.listen()
-                except Exception as e:
-                    logger.error(f"Error in client loop: {e}")
-            
-            if not self.running:
-                break
+            try:
+                if await self.connect():
+                    # Connection successful
+                    try:
+                        await self.listen()
+                    except Exception as e:
+                        logger.error(f"Error in client loop: {e}")
+                else:
+                    # Connection failed
+                    with self.lock:
+                        self.reconnect_attempts += 1
                 
-            logger.info("Reconnecting in 5 seconds...")
-            # Use shorter sleep intervals to be more responsive to shutdown
-            for _ in range(50):  # 5 seconds total, checking every 0.1 seconds
                 if not self.running:
                     break
-                await asyncio.sleep(0.1)
+                
+                # Calculate reconnect delay with exponential backoff
+                with self.lock:
+                    delay = min(self.reconnect_delay * (2 ** min(self.reconnect_attempts - 1, 5)), self.max_reconnect_delay)
+                
+                logger.info(f"Reconnecting in {delay} seconds... (attempt {self.reconnect_attempts})")
+                
+                # Use shorter sleep intervals to be more responsive to shutdown
+                sleep_intervals = int(delay * 10)  # 0.1 second intervals
+                for _ in range(sleep_intervals):
+                    if not self.running:
+                        break
+                    await asyncio.sleep(0.1)
+                    
+            except Exception as e:
+                logger.error(f"Unexpected error in run loop: {e}")
+                # Continue with reconnection logic
+                if not self.running:
+                    break
+                await asyncio.sleep(1)
 
     def stop(self):
         with self.lock:
@@ -443,8 +531,10 @@ class TunnelClient:
         
         @dashboard_app.get("/api/status")
         async def get_status():
+            connected = self.websocket is not None and not self.websocket.closed
             return {
                 "running": self.running,
+                "connected": connected,
                 "tunnel_hostname": self.assigned_hostname,
                 "local_endpoint": self.local_endpoint,
                 "webhook_count": len(self.webhook_history)
@@ -496,15 +586,19 @@ class TunnelClient:
                 if self.connection_start_time:
                     uptime_seconds = (datetime.now(timezone.utc) - self.connection_start_time).total_seconds()
                 
+                connected = self.websocket is not None and not self.websocket.closed
+                
                 return {
                     "running": self.running,
-                    "connected": self.assigned_hostname is not None,
+                    "connected": connected,
                     "tunnel_hostname": self.assigned_hostname,
                     "local_endpoint": self.local_endpoint,
                     "server_url": self.server_url,
                     "webhook_count": len(self.webhook_history),
                     "uptime_seconds": uptime_seconds,
-                    "connection_start_time": self.connection_start_time.isoformat() if self.connection_start_time else None
+                    "connection_start_time": self.connection_start_time.isoformat() if self.connection_start_time else None,
+                    "reconnect_attempts": self.reconnect_attempts,
+                    "last_keepalive_ago": time.time() - self.last_keepalive if self.last_keepalive else None
                 }
         
         @api_app.get("/webhooks")
@@ -885,8 +979,8 @@ class TunnelClient:
                 document.getElementById('status').innerHTML = `
                     <div class="status-item">
                         <strong>Connection Status</strong>
-                        <div class="status-value ${status.running ? 'status-connected' : 'status-disconnected'}">
-                            ${status.running ? 'Connected' : 'Disconnected'}
+                        <div class="status-value ${status.connected ? 'status-connected' : 'status-disconnected'}">
+                            ${status.connected ? 'Connected' : 'Disconnected'}
                         </div>
                     </div>
                     <div class="status-item">
