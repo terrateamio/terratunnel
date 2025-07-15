@@ -56,7 +56,7 @@ The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
    - FastAPI-based server handling WebSocket connections
    - Manages tunnel registration and request routing
    - Thread-safe connection management with locks
-   - Optional GitHub IP validation and domain ownership validation
+   - Optional VCS IP validation (GitHub, GitLab) and domain ownership validation
    - Graceful shutdown handling
 
 2. **Client Component** (`terratunnel/client/app.py`)
@@ -95,7 +95,7 @@ The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
 2. `/_health` - Health check endpoint (no auth required)
 3. `/_admin` - Admin dashboard (API key protected)
 4. `/_admin/api/tunnels` - Admin API (API key protected)
-5. `/{path:path}` - Catch-all proxy route (GitHub IP validation applies here)
+5. `/{path:path}` - Catch-all proxy route (VCS IP validation applies here)
 
 **Client Routes** (when dashboard enabled):
 - Dashboard on port 8080: `/`, `/api/webhooks`, `/api/status`
@@ -103,7 +103,7 @@ The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
 
 ### Security Features
 
-- **GitHub IP Validation**: Optional filtering to only allow GitHub webhook IPs
+- **VCS IP Validation**: Optional filtering to only allow VCS provider IPs (GitHub, GitLab)
 - **Domain Ownership Validation**: `.well-known/terratunnel` endpoint verification
 - **JWT Authentication**: For GitHub App webhook updates
 - **Random Subdomain Generation**: Unpredictable tunnel URLs for security

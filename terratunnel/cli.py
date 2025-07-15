@@ -25,13 +25,14 @@ def cli(log_level):
               help="Port to bind (default: 8000, env: TERRATUNNEL_PORT)")
 @click.option("--domain", default="tunnel.terrateam.dev", envvar="TERRATUNNEL_DOMAIN",
               help="Domain name for tunnel hostnames (default: tunnel.terrateam.dev, env: TERRATUNNEL_DOMAIN)")
-@click.option("--github-only", is_flag=True, envvar="TERRATUNNEL_GITHUB_ONLY",
-              help="Only allow requests from GitHub webhook IPs (env: TERRATUNNEL_GITHUB_ONLY)")
+@click.option("--vcs-only", "--github-only", "vcs_only", is_flag=True, 
+              envvar=["TERRATUNNEL_VCS_ONLY", "TERRATUNNEL_GITHUB_ONLY"],
+              help="Only allow requests from VCS provider IPs (GitHub, GitLab) (env: TERRATUNNEL_VCS_ONLY or TERRATUNNEL_GITHUB_ONLY)")
 @click.option("--validate-endpoint", is_flag=True, envvar="TERRATUNNEL_VALIDATE_ENDPOINT",
               help="Validate endpoint ownership via .well-known/terratunnel (env: TERRATUNNEL_VALIDATE_ENDPOINT)")
-def server(host, port, domain, github_only, validate_endpoint):
+def server(host, port, domain, vcs_only, validate_endpoint):
     """Start a tunnel server."""
-    run_server(host=host, port=port, domain=domain, github_only=github_only, validate_endpoint=validate_endpoint)
+    run_server(host=host, port=port, domain=domain, vcs_only=vcs_only, validate_endpoint=validate_endpoint)
 
 
 @cli.command()
