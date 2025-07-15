@@ -37,7 +37,7 @@ python -m terratunnel client --local-endpoint http://localhost:3000
 **Server:**
 - `--domain` - Your domain for tunnel URLs (required)
 - `--port` - Server port (default: 8000)
-- `--github-only` - Only allow GitHub webhook IPs
+- `--vcs-only` - Only allow VCS provider IPs (GitHub, GitLab)
 
 **Client:**
 - `--local-endpoint` - Local URL to forward to (required)

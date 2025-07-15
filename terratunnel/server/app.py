@@ -8,6 +8,7 @@ import uuid
 import time
 import ipaddress
 import os
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List, Union
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
@@ -139,17 +140,35 @@ class DomainValidator:
         return time.time() - connection_start > self.validation_freshness
 
 
-class GitHubIPValidator:
+class VCSIPValidator:
+    """Validates IPs from various VCS providers (GitHub, GitLab, etc.)"""
     def __init__(self):
-        self.hook_ranges: List[ipaddress.IPv4Network] = []
-        self.hook_ranges_v6: List[ipaddress.IPv6Network] = []
-        self.actions_ranges: List[ipaddress.IPv4Network] = []
-        self.actions_ranges_v6: List[ipaddress.IPv6Network] = []
+        # GitHub IP ranges
+        self.github_hook_ranges: List[ipaddress.IPv4Network] = []
+        self.github_hook_ranges_v6: List[ipaddress.IPv6Network] = []
+        self.github_actions_ranges: List[ipaddress.IPv4Network] = []
+        self.github_actions_ranges_v6: List[ipaddress.IPv6Network] = []
+        
+        # GitLab IP ranges (hardcoded as per GitLab documentation)
+        self.gitlab_ranges: List[ipaddress.IPv4Network] = []
+        self._init_gitlab_ranges()
+        
         self.last_updated = 0
         self.cache_duration = 3600  # 1 hour in seconds
         self.lock = threading.Lock()
     
-    async def update_hook_ranges(self):
+    def _init_gitlab_ranges(self):
+        """Initialize GitLab IP ranges from their documented values"""
+        try:
+            self.gitlab_ranges = [
+                ipaddress.IPv4Network("34.74.90.64/28", strict=False),
+                ipaddress.IPv4Network("34.74.226.0/24", strict=False)
+            ]
+            logger.info(f"     Initialized GitLab IP ranges: {len(self.gitlab_ranges)} ranges")
+        except Exception as e:
+            logger.error(f"     Failed to initialize GitLab IP ranges: {e}")
+    
+    async def update_github_ranges(self):
         """Fetch GitHub hook and actions IP ranges from the API"""
         try:
             async with httpx.AsyncClient() as client:
@@ -188,10 +207,10 @@ class GitHubIPValidator:
                         logger.warning(f"Invalid CIDR range from GitHub API (actions): {cidr} - {e}")
                 
                 with self.lock:
-                    self.hook_ranges = hook_ranges_v4
-                    self.hook_ranges_v6 = hook_ranges_v6
-                    self.actions_ranges = actions_ranges_v4
-                    self.actions_ranges_v6 = actions_ranges_v6
+                    self.github_hook_ranges = hook_ranges_v4
+                    self.github_hook_ranges_v6 = hook_ranges_v6
+                    self.github_actions_ranges = actions_ranges_v4
+                    self.github_actions_ranges_v6 = actions_ranges_v6
                     self.last_updated = time.time()
                 
                 logger.info(f"     Updated GitHub IP ranges: hooks={len(hook_ranges_v4)} IPv4 + {len(hook_ranges_v6)} IPv6, actions={len(actions_ranges_v4)} IPv4 + {len(actions_ranges_v6)} IPv6")
@@ -201,15 +220,16 @@ class GitHubIPValidator:
             logger.error(f"     Failed to fetch GitHub IP ranges: {e}")
             return False
     
-    async def is_github_ip(self, ip_str: str) -> bool:
-        """Check if an IP address is in GitHub's hook or actions ranges"""
+    async def is_vcs_ip(self, ip_str: str) -> bool:
+        """Check if an IP address is from a known VCS provider (GitHub or GitLab)"""
         # Update cache if expired
         if time.time() - self.last_updated > self.cache_duration:
-            await self.update_hook_ranges()
+            await self.update_github_ranges()
         
-        if not self.hook_ranges and not self.hook_ranges_v6 and not self.actions_ranges and not self.actions_ranges_v6:
+        # Check if we have any ranges loaded
+        if not self.github_hook_ranges and not self.github_hook_ranges_v6 and not self.github_actions_ranges and not self.github_actions_ranges_v6 and not self.gitlab_ranges:
             # If we don't have ranges loaded, allow all (fail open)
-            logger.warning("     No GitHub IP ranges loaded, allowing request")
+            logger.warning("     No VCS IP ranges loaded, allowing request")
             return True
         
         try:
@@ -217,26 +237,31 @@ class GitHubIPValidator:
             if ':' not in ip_str:
                 ip = ipaddress.IPv4Address(ip_str)
                 with self.lock:
-                    # Check hook ranges
-                    for network in self.hook_ranges:
+                    # Check GitHub hook ranges
+                    for network in self.github_hook_ranges:
                         if ip in network:
                             return True
-                    # Check actions ranges
-                    for network in self.actions_ranges:
+                    # Check GitHub actions ranges
+                    for network in self.github_actions_ranges:
+                        if ip in network:
+                            return True
+                    # Check GitLab ranges
+                    for network in self.gitlab_ranges:
                         if ip in network:
                             return True
             else:
                 # Parse as IPv6
                 ip = ipaddress.IPv6Address(ip_str)
                 with self.lock:
-                    # Check hook ranges
-                    for network in self.hook_ranges_v6:
+                    # Check GitHub hook ranges
+                    for network in self.github_hook_ranges_v6:
                         if ip in network:
                             return True
-                    # Check actions ranges
-                    for network in self.actions_ranges_v6:
+                    # Check GitHub actions ranges
+                    for network in self.github_actions_ranges_v6:
                         if ip in network:
                             return True
+                    # GitLab doesn't have IPv6 ranges documented
             
             return False
             
@@ -345,9 +370,9 @@ class ConnectionManager:
 
 app = FastAPI(title="Tunnel Server")
 manager = None
-github_validator = None
+vcs_validator = None
 domain_validator = None
-github_only_mode = False
+vcs_only_mode = False
 domain_validation_mode = False
 
 
@@ -585,7 +610,7 @@ async def admin_dashboard(request: Request):
                 <h1>🚇 Terratunnel Admin</h1>
                 <div class="settings">
                     Domain: {manager.domain} | 
-                    GitHub-only: {'✓' if github_only_mode else '✗'} |
+                    VCS-only: {'✓' if vcs_only_mode else '✗'} |
                     Validation: {'✓' if domain_validation_mode else '✗'}
                 </div>
             </div>
@@ -695,7 +720,7 @@ async def admin_api_tunnels(request: Request):
         },
         "config": {
             "domain": manager.domain,
-            "github_only": github_only_mode,
+            "vcs_only": vcs_only_mode,
             "validation_required": domain_validation_mode
         }
     }
@@ -703,23 +728,31 @@ async def admin_api_tunnels(request: Request):
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy_request(request: Request, path: str):
-    # GitHub IP validation if enabled
-    if github_only_mode and github_validator:
-        client_ip = request.client.host if request.client else "unknown"
+    # VCS IP validation if enabled
+    if vcs_only_mode and vcs_validator:
+        # Check if this is a work manifest path that should bypass IP validation
+        # Pattern: /api/*/v1/work-manifests/{uuid}/*
+        # Self-hosted CI/CD runners don't have GitHub/GitLab/etc IPs
+        work_manifest_pattern = r'^api/[^/]+/v1/work-manifests/[a-f0-9\-]{36}/.*$'
         
-        # Check X-Forwarded-For header first (common in reverse proxy setups)
-        forwarded_for = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        if forwarded_for:
-            client_ip = forwarded_for
-        
-        # Real IP header (some proxy configurations)
-        real_ip = request.headers.get("x-real-ip", "").strip()
-        if real_ip:
-            client_ip = real_ip
-        
-        if not await github_validator.is_github_ip(client_ip):
-            logger.warning(f"     Blocked non-GitHub IP: {client_ip}")
-            raise HTTPException(status_code=403, detail="Access denied: Not a GitHub IP")
+        if re.match(work_manifest_pattern, path):
+            logger.info(f"     Bypassing IP validation for work manifest path: /{path}")
+        else:
+            client_ip = request.client.host if request.client else "unknown"
+            
+            # Check X-Forwarded-For header first (common in reverse proxy setups)
+            forwarded_for = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+            if forwarded_for:
+                client_ip = forwarded_for
+            
+            # Real IP header (some proxy configurations)
+            real_ip = request.headers.get("x-real-ip", "").strip()
+            if real_ip:
+                client_ip = real_ip
+            
+            if not await vcs_validator.is_vcs_ip(client_ip):
+                logger.warning(f"     Blocked non-VCS IP: {client_ip}")
+                raise HTTPException(status_code=403, detail="Access denied: Not a VCS provider IP")
     
     host_header = request.headers.get("host", "")
     
@@ -861,11 +894,11 @@ async def proxy_request(request: Request, path: str):
     )
 
 
-async def init_github_validator():
-    """Initialize GitHub IP validator and fetch initial ranges"""
-    global github_validator
-    github_validator = GitHubIPValidator()
-    await github_validator.update_hook_ranges()
+async def init_vcs_validator():
+    """Initialize VCS IP validator and fetch initial ranges"""
+    global vcs_validator
+    vcs_validator = VCSIPValidator()
+    await vcs_validator.update_github_ranges()
 
 
 async def init_domain_validator():
@@ -874,18 +907,18 @@ async def init_domain_validator():
     domain_validator = DomainValidator()
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.terrateam.dev", github_only: bool = False, validate_endpoint: bool = False):
-    global manager, github_only_mode, domain_validation_mode
+def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.terrateam.dev", vcs_only: bool = False, validate_endpoint: bool = False):
+    global manager, vcs_only_mode, domain_validation_mode
     manager = ConnectionManager(domain)
-    github_only_mode = github_only
+    vcs_only_mode = vcs_only
     domain_validation_mode = validate_endpoint
     
     # Build feature flags for logging
     features = []
-    if github_only:
-        features.append("GitHub webhooks only")
-        # Initialize GitHub validator synchronously
-        asyncio.run(init_github_validator())
+    if vcs_only:
+        features.append("VCS webhooks only (GitHub/GitLab)")
+        # Initialize VCS validator synchronously
+        asyncio.run(init_vcs_validator())
     
     if validate_endpoint:
         features.append("endpoint validation")

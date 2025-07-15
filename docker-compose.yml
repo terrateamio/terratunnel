@@ -4,7 +4,7 @@ services:
   # Terratunnel Server
   terratunnel-server:
     image: ghcr.io/terrateamio/terratunnel:latest
-    command: server --domain tunnel.example.com --github-only
+    command: server --domain tunnel.example.com --vcs-only
     ports:
       - "8000:8000"
     restart: unless-stopped
