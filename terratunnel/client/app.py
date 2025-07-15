@@ -237,7 +237,8 @@ class TunnelClient:
                     url=url,
                     headers=headers,
                     params=query_params,
-                    content=body
+                    content=body,
+                    timeout=30.0  # 30 second timeout
                 )
                 
                 response_data = {

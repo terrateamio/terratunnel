@@ -222,6 +222,7 @@ class ConnectionManager:
         self.subdomain_to_endpoint: Dict[str, str] = {}
         self.pending_requests: Dict[str, asyncio.Future] = {}
         self.connection_start_times: Dict[str, float] = {}
+        self.validated_endpoints: Dict[str, bool] = {}  # Track validation state per subdomain
         self.domain = domain
         self.lock = threading.Lock()
 
@@ -237,6 +238,9 @@ class ConnectionManager:
             
             if subdomain in self.connection_start_times:
                 del self.connection_start_times[subdomain]
+            
+            if subdomain in self.validated_endpoints:
+                del self.validated_endpoints[subdomain]
             
             if subdomain in self.subdomain_to_endpoint:
                 del self.subdomain_to_endpoint[subdomain]
@@ -356,38 +360,8 @@ async def websocket_endpoint(websocket: WebSocket):
             "subdomain": subdomain
         }))
         
-        # Perform endpoint validation AFTER tunnel is established
-        validation_failed = False
-        if domain_validation_mode and domain_validator:
-            # Parse the full endpoint URL to extract host and port
-            try:
-                from urllib.parse import urlparse
-                parsed_endpoint = urlparse(local_endpoint)
-                validation_host = parsed_endpoint.hostname or 'localhost'
-                validation_port = parsed_endpoint.port or (443 if parsed_endpoint.scheme == 'https' else 80)
-                validation_endpoint = f"{validation_host}:{validation_port}"
-                
-                if not await domain_validator.validate_domain(validation_endpoint):
-                    logger.warning(f"     Endpoint validation failed for: {validation_endpoint}")
-                    validation_failed = True
-            except Exception as e:
-                logger.error(f"     Failed to parse endpoint URL {local_endpoint}: {e}")
-                # Continue anyway - don't block on parsing errors
-                logger.info(f"     Continuing without validation due to parsing error")
-        
-        # If validation failed, clean up and close connection
-        if validation_failed:
-            with manager.lock:
-                if subdomain in manager.active_connections:
-                    del manager.active_connections[subdomain]
-                if hostname in manager.hostname_to_subdomain:
-                    del manager.hostname_to_subdomain[hostname]
-                if subdomain in manager.subdomain_to_endpoint:
-                    del manager.subdomain_to_endpoint[subdomain]
-                if subdomain in manager.connection_start_times:
-                    del manager.connection_start_times[subdomain]
-            await websocket.close(code=1008, reason="Endpoint validation failed")
-            return
+        # NOTE: Endpoint validation removed here - will be done on first request instead
+        # This allows the local endpoint to start up after the tunnel is established
         
         while True:
             try:
@@ -764,6 +738,65 @@ async def proxy_request(request: Request, path: str):
                         raise HTTPException(status_code=403, detail="Endpoint validation failed")
             except Exception as e:
                 logger.warning(f"     Failed to parse endpoint URL for revalidation {local_endpoint}: {e}")
+    
+    # Check if this subdomain has been validated (first request validation)
+    if domain_validation_mode and domain_validator:
+        with manager.lock:
+            validated = manager.validated_endpoints.get(subdomain, False)
+        
+        if not validated:
+            local_endpoint = manager.get_endpoint_from_subdomain(subdomain)
+            if local_endpoint:
+                # Parse endpoint to get validation format
+                try:
+                    from urllib.parse import urlparse
+                    parsed_endpoint = urlparse(local_endpoint)
+                    validation_host = parsed_endpoint.hostname or 'localhost'
+                    validation_port = parsed_endpoint.port or (443 if parsed_endpoint.scheme == 'https' else 80)
+                    validation_endpoint = f"{validation_host}:{validation_port}"
+                    
+                    # Skip validation for local endpoints
+                    host_part = validation_endpoint.split(':')[0] if ':' in validation_endpoint else validation_endpoint
+                    is_local = (
+                        host_part in ['localhost', '127.0.0.1', '::1'] or 
+                        host_part.startswith('192.168.') or 
+                        host_part.startswith('10.') or 
+                        host_part.startswith('172.') or
+                        host_part.startswith('169.254.') or
+                        host_part.startswith('fc00:') or
+                        host_part.startswith('fe80:')
+                    )
+                    
+                    if not is_local:
+                        logger.info(f"     Performing first-request validation for: {validation_endpoint}")
+                        
+                        # Validation with retry logic
+                        max_retries = 3
+                        retry_delay = 1.0
+                        validation_success = False
+                        
+                        for attempt in range(max_retries + 1):
+                            if await domain_validator.validate_domain(validation_endpoint):
+                                validation_success = True
+                                logger.info(f"     First-request validation successful: {validation_endpoint}")
+                                break
+                            elif attempt < max_retries:
+                                logger.warning(f"     Validation attempt {attempt + 1}/{max_retries + 1} failed for {validation_endpoint}")
+                                logger.info(f"     Retrying validation in {retry_delay} seconds...")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2  # Exponential backoff
+                        
+                        if not validation_success:
+                            logger.error(f"     First-request validation failed after {max_retries + 1} attempts: {validation_endpoint}")
+                            raise HTTPException(status_code=403, detail="Endpoint validation failed")
+                    
+                    # Mark as validated
+                    with manager.lock:
+                        manager.validated_endpoints[subdomain] = True
+                        
+                except Exception as e:
+                    logger.warning(f"     Failed to parse endpoint URL for validation {local_endpoint}: {e}")
+                    # Continue anyway - don't block on parsing errors
     
     body = await request.body()
     
