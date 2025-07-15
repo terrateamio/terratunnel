@@ -337,26 +337,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=1008, reason="Missing local_endpoint")
             return
         
-        # Perform endpoint validation if enabled
-        if domain_validation_mode and domain_validator:
-            # Parse the full endpoint URL to extract host and port
-            try:
-                from urllib.parse import urlparse
-                parsed_endpoint = urlparse(local_endpoint)
-                validation_host = parsed_endpoint.hostname or 'localhost'
-                validation_port = parsed_endpoint.port or (443 if parsed_endpoint.scheme == 'https' else 80)
-                validation_endpoint = f"{validation_host}:{validation_port}"
-                
-                if not await domain_validator.validate_domain(validation_endpoint):
-                    logger.warning(f"     Endpoint validation failed for: {validation_endpoint}")
-                    await websocket.close(code=1008, reason="Endpoint validation failed")
-                    return
-            except Exception as e:
-                logger.error(f"     Failed to parse endpoint URL {local_endpoint}: {e}")
-                # Continue anyway - don't block on parsing errors
-                logger.info(f"     Continuing without validation due to parsing error")
-        
-        # Generate subdomain and complete connection
+        # Generate subdomain and complete connection FIRST
         subdomain = manager.generate_subdomain()
         hostname = f"{subdomain}.{manager.domain}"
         
@@ -368,11 +349,45 @@ async def websocket_endpoint(websocket: WebSocket):
         
         logger.info(f"     WebSocket client connected: {hostname} -> {local_endpoint}")
         
+        # Send hostname assignment immediately
         await websocket.send_text(json.dumps({
             "type": "hostname_assigned",
             "hostname": hostname,
             "subdomain": subdomain
         }))
+        
+        # Perform endpoint validation AFTER tunnel is established
+        validation_failed = False
+        if domain_validation_mode and domain_validator:
+            # Parse the full endpoint URL to extract host and port
+            try:
+                from urllib.parse import urlparse
+                parsed_endpoint = urlparse(local_endpoint)
+                validation_host = parsed_endpoint.hostname or 'localhost'
+                validation_port = parsed_endpoint.port or (443 if parsed_endpoint.scheme == 'https' else 80)
+                validation_endpoint = f"{validation_host}:{validation_port}"
+                
+                if not await domain_validator.validate_domain(validation_endpoint):
+                    logger.warning(f"     Endpoint validation failed for: {validation_endpoint}")
+                    validation_failed = True
+            except Exception as e:
+                logger.error(f"     Failed to parse endpoint URL {local_endpoint}: {e}")
+                # Continue anyway - don't block on parsing errors
+                logger.info(f"     Continuing without validation due to parsing error")
+        
+        # If validation failed, clean up and close connection
+        if validation_failed:
+            with manager.lock:
+                if subdomain in manager.active_connections:
+                    del manager.active_connections[subdomain]
+                if hostname in manager.hostname_to_subdomain:
+                    del manager.hostname_to_subdomain[hostname]
+                if subdomain in manager.subdomain_to_endpoint:
+                    del manager.subdomain_to_endpoint[subdomain]
+                if subdomain in manager.connection_start_times:
+                    del manager.connection_start_times[subdomain]
+            await websocket.close(code=1008, reason="Endpoint validation failed")
+            return
         
         while True:
             try:
