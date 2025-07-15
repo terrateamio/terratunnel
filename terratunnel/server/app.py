@@ -143,12 +143,14 @@ class GitHubIPValidator:
     def __init__(self):
         self.hook_ranges: List[ipaddress.IPv4Network] = []
         self.hook_ranges_v6: List[ipaddress.IPv6Network] = []
+        self.actions_ranges: List[ipaddress.IPv4Network] = []
+        self.actions_ranges_v6: List[ipaddress.IPv6Network] = []
         self.last_updated = 0
         self.cache_duration = 3600  # 1 hour in seconds
         self.lock = threading.Lock()
     
     async def update_hook_ranges(self):
-        """Fetch GitHub hook IP ranges from the API"""
+        """Fetch GitHub hook and actions IP ranges from the API"""
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get("https://api.github.com/meta", timeout=10.0)
@@ -156,40 +158,58 @@ class GitHubIPValidator:
                 data = response.json()
                 
                 hook_cidrs = data.get("hooks", [])
-                ranges_v4 = []
-                ranges_v6 = []
+                actions_cidrs = data.get("actions", [])
                 
+                hook_ranges_v4 = []
+                hook_ranges_v6 = []
+                actions_ranges_v4 = []
+                actions_ranges_v6 = []
+                
+                # Process hook IPs
                 for cidr in hook_cidrs:
                     try:
                         # Try IPv4 first
                         if ':' not in cidr:
-                            ranges_v4.append(ipaddress.IPv4Network(cidr, strict=False))
+                            hook_ranges_v4.append(ipaddress.IPv4Network(cidr, strict=False))
                         else:
-                            ranges_v6.append(ipaddress.IPv6Network(cidr, strict=False))
+                            hook_ranges_v6.append(ipaddress.IPv6Network(cidr, strict=False))
                     except ValueError as e:
-                        logger.warning(f"Invalid CIDR range from GitHub API: {cidr} - {e}")
+                        logger.warning(f"Invalid CIDR range from GitHub API (hooks): {cidr} - {e}")
+                
+                # Process actions IPs
+                for cidr in actions_cidrs:
+                    try:
+                        # Try IPv4 first
+                        if ':' not in cidr:
+                            actions_ranges_v4.append(ipaddress.IPv4Network(cidr, strict=False))
+                        else:
+                            actions_ranges_v6.append(ipaddress.IPv6Network(cidr, strict=False))
+                    except ValueError as e:
+                        logger.warning(f"Invalid CIDR range from GitHub API (actions): {cidr} - {e}")
                 
                 with self.lock:
-                    self.hook_ranges = ranges_v4
-                    self.hook_ranges_v6 = ranges_v6
+                    self.hook_ranges = hook_ranges_v4
+                    self.hook_ranges_v6 = hook_ranges_v6
+                    self.actions_ranges = actions_ranges_v4
+                    self.actions_ranges_v6 = actions_ranges_v6
                     self.last_updated = time.time()
                 
-                logger.info(f"     Updated GitHub hook IP ranges: {len(ranges_v4)} IPv4 + {len(ranges_v6)} IPv6 ranges loaded")
+                logger.info(f"     Updated GitHub IP ranges: hooks={len(hook_ranges_v4)} IPv4 + {len(hook_ranges_v6)} IPv6, actions={len(actions_ranges_v4)} IPv4 + {len(actions_ranges_v6)} IPv6")
                 return True
                 
         except Exception as e:
-            logger.error(f"     Failed to fetch GitHub hook IP ranges: {e}")
+            logger.error(f"     Failed to fetch GitHub IP ranges: {e}")
             return False
     
-    async def is_github_hook_ip(self, ip_str: str) -> bool:
-        """Check if an IP address is in GitHub's hook ranges"""
+    async def is_github_ip(self, ip_str: str) -> bool:
+        """Check if an IP address is in GitHub's hook or actions ranges"""
         # Update cache if expired
         if time.time() - self.last_updated > self.cache_duration:
             await self.update_hook_ranges()
         
-        if not self.hook_ranges and not self.hook_ranges_v6:
+        if not self.hook_ranges and not self.hook_ranges_v6 and not self.actions_ranges and not self.actions_ranges_v6:
             # If we don't have ranges loaded, allow all (fail open)
-            logger.warning("     No GitHub hook IP ranges loaded, allowing request")
+            logger.warning("     No GitHub IP ranges loaded, allowing request")
             return True
         
         try:
@@ -197,14 +217,24 @@ class GitHubIPValidator:
             if ':' not in ip_str:
                 ip = ipaddress.IPv4Address(ip_str)
                 with self.lock:
+                    # Check hook ranges
                     for network in self.hook_ranges:
+                        if ip in network:
+                            return True
+                    # Check actions ranges
+                    for network in self.actions_ranges:
                         if ip in network:
                             return True
             else:
                 # Parse as IPv6
                 ip = ipaddress.IPv6Address(ip_str)
                 with self.lock:
+                    # Check hook ranges
                     for network in self.hook_ranges_v6:
+                        if ip in network:
+                            return True
+                    # Check actions ranges
+                    for network in self.actions_ranges_v6:
                         if ip in network:
                             return True
             
@@ -687,9 +717,9 @@ async def proxy_request(request: Request, path: str):
         if real_ip:
             client_ip = real_ip
         
-        if not await github_validator.is_github_hook_ip(client_ip):
+        if not await github_validator.is_github_ip(client_ip):
             logger.warning(f"     Blocked non-GitHub IP: {client_ip}")
-            raise HTTPException(status_code=403, detail="Access denied: Not a GitHub webhook IP")
+            raise HTTPException(status_code=403, detail="Access denied: Not a GitHub IP")
     
     host_header = request.headers.get("host", "")
     
