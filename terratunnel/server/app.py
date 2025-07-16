@@ -398,7 +398,7 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         <body>
             <div class="header">
                 <div class="header-content">
-                    <div class="logo">🚇 Terratunnel</div>
+                    <div class="logo"><img src="/logo.svg" alt="Terratunnel" style="height: 24px; vertical-align: middle; margin-right: 8px;">Terratunnel</div>
                     <div class="user-info">
                         <span>Signed in as <strong>{user['username']}</strong> ({user['provider']})</span>
                         <a href="/auth/logout?redirect_uri=/" class="logout-link">Sign out</a>
@@ -544,7 +544,7 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         </head>
         <body>
             <div class="container">
-                <div class="logo">🚇</div>
+                <div class="logo"><img src="/logo.svg" alt="Terratunnel" style="height: 48px;"></div>
                 <h1>Welcome to Terratunnel</h1>
                 <p>Secure HTTP tunneling for webhook development and testing.</p>
                 
@@ -835,7 +835,7 @@ async def generate_api_key(request: Request, auth_token: Optional[str] = Cookie(
         <body>
             <div class="header">
                 <div class="header-content">
-                    <div class="logo">🚇 Terratunnel</div>
+                    <div class="logo"><img src="/logo.svg" alt="Terratunnel" style="height: 24px; vertical-align: middle; margin-right: 8px;">Terratunnel</div>
                 </div>
             </div>
             
@@ -883,6 +883,24 @@ async def revoke_api_key(key_id: int, request: Request, auth_token: Optional[str
             raise HTTPException(status_code=404, detail="API key not found")
     
     return RedirectResponse(url="/?revoked=true", status_code=302)
+
+
+@app.get("/logo.svg")
+async def serve_logo():
+    """Serve the logo.svg file"""
+    import os
+    logo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logo.svg")
+    if os.path.exists(logo_path):
+        with open(logo_path, "r") as f:
+            svg_content = f.read()
+        return Response(content=svg_content, media_type="image/svg+xml")
+    else:
+        # Return a placeholder if logo.svg doesn't exist
+        placeholder = '''<svg width="48" height="48" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="24" cy="24" r="20" fill="#0066cc"/>
+            <text x="24" y="32" text-anchor="middle" fill="white" font-size="24" font-weight="bold">T</text>
+        </svg>'''
+        return Response(content=placeholder, media_type="image/svg+xml")
 
 
 @app.get("/_health")
@@ -1035,7 +1053,7 @@ async def admin_dashboard(request: Request, current_user = Depends(require_admin
     <body>
         <div class="container">
             <div class="header">
-                <h1>🚇 Terratunnel Admin</h1>
+                <h1><img src="/logo.svg" alt="Terratunnel" style="height: 32px; vertical-align: middle; margin-right: 8px;">Terratunnel Admin</h1>
                 <div class="settings">
                     Domain: {manager.domain} | 
                     User: {current_user['username']} ({current_user['provider']})
