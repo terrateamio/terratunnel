@@ -6,268 +6,19 @@ import string
 import json
 import uuid
 import time
-import ipaddress
 import os
-import re
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional, List, Union
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
-from fastapi.responses import JSONResponse, Response, HTMLResponse
+from typing import Dict, Optional
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends
+from fastapi.responses import JSONResponse, Response, HTMLResponse, RedirectResponse
 import uvicorn
-import httpx
+from .database import Database
+from .config import Config
+from .auth import auth_router, require_admin_user
+from .api import api_router
+from .middleware import AuthMiddleware
 
 
 logger = logging.getLogger("terratunnel-server")
-
-
-class DomainValidator:
-    def __init__(self):
-        self.validation_cache: Dict[str, Dict] = {}
-        self.cache_duration = 3600  # 1 hour in seconds
-        self.validation_freshness = 86400  # 24 hours in seconds
-        self.lock = threading.Lock()
-    
-    async def validate_domain(self, endpoint: str) -> bool:
-        """Validate endpoint ownership by checking .well-known/terratunnel endpoint"""
-        # Skip validation for local/private endpoints
-        host_part = endpoint.split(':')[0] if ':' in endpoint else endpoint
-        is_local = (
-            host_part in ['localhost', '127.0.0.1', '::1'] or 
-            host_part.startswith('192.168.') or 
-            host_part.startswith('10.') or 
-            host_part.startswith('172.') or
-            host_part.startswith('169.254.') or  # Link-local
-            host_part.startswith('fc00:') or  # IPv6 ULA
-            host_part.startswith('fe80:')  # IPv6 link-local
-        )
-        
-        if is_local:
-            logger.info(f"     Skipping validation for local/private endpoint: {endpoint}")
-            return True
-        
-        # Check cache first
-        with self.lock:
-            cached = self.validation_cache.get(endpoint)
-            if cached and time.time() - cached["cached_at"] < self.cache_duration:
-                return cached["valid"]
-        
-        try:
-            # Make HTTP GET request to endpoint validation endpoint
-            async with httpx.AsyncClient() as client:
-                protocol = "https"  # Public endpoints should use HTTPS
-                validation_url = f"{protocol}://{endpoint}/.well-known/terratunnel"
-                logger.info(f"     Validating endpoint ownership: {validation_url}")
-                
-                response = await client.get(validation_url, timeout=10.0)
-                
-                if response.status_code != 200:
-                    logger.warning(f"     Endpoint validation failed - HTTP {response.status_code}: {endpoint}")
-                    self._cache_result(endpoint, False)
-                    return False
-                
-                # Parse JSON response
-                try:
-                    data = response.json()
-                except json.JSONDecodeError:
-                    logger.warning(f"     Endpoint validation failed - Invalid JSON: {endpoint}")
-                    self._cache_result(endpoint, False)
-                    return False
-                
-                # Validate response format
-                if not self._validate_response_format(data):
-                    logger.warning(f"     Endpoint validation failed - Invalid format: {endpoint}")
-                    self._cache_result(endpoint, False)
-                    return False
-                
-                # Validate timestamp freshness
-                if not self._validate_timestamp_freshness(data.get("timestamp")):
-                    logger.warning(f"     Endpoint validation failed - Stale timestamp: {endpoint}")
-                    self._cache_result(endpoint, False)
-                    return False
-                
-                logger.info(f"     Endpoint validation successful: {endpoint}")
-                self._cache_result(endpoint, True)
-                return True
-                
-        except Exception as e:
-            logger.warning(f"     Endpoint validation error for {endpoint}: {e}")
-            self._cache_result(endpoint, False)
-            return False
-    
-    def _validate_response_format(self, data: dict) -> bool:
-        """Validate the JSON response format"""
-        required_fields = ["tunnel_validation", "timestamp"]
-        
-        for field in required_fields:
-            if field not in data:
-                return False
-        
-        if data.get("tunnel_validation") != "terratunnel-v1":
-            return False
-        
-        return True
-    
-    def _validate_timestamp_freshness(self, timestamp_str: str) -> bool:
-        """Validate that timestamp is within 24 hours"""
-        try:
-            # Parse ISO8601 timestamp
-            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-            
-            # Ensure timestamp is timezone-aware
-            if timestamp.tzinfo is None:
-                timestamp = timestamp.replace(tzinfo=timezone.utc)
-            
-            now = datetime.now(timezone.utc)
-            age = now - timestamp
-            
-            # Check if timestamp is within validation freshness window
-            return age.total_seconds() <= self.validation_freshness
-            
-        except (ValueError, TypeError) as e:
-            logger.warning(f"     Invalid timestamp format: {timestamp_str} - {e}")
-            return False
-    
-    def _cache_result(self, endpoint: str, valid: bool):
-        """Cache validation result"""
-        with self.lock:
-            self.validation_cache[endpoint] = {
-                "valid": valid,
-                "cached_at": time.time()
-            }
-    
-    def should_revalidate(self, endpoint: str, connection_start: float) -> bool:
-        """Check if endpoint should be revalidated for long-lived connections"""
-        return time.time() - connection_start > self.validation_freshness
-
-
-class VCSIPValidator:
-    """Validates IPs from various VCS providers (GitHub, GitLab, etc.)"""
-    def __init__(self):
-        # GitHub IP ranges
-        self.github_hook_ranges: List[ipaddress.IPv4Network] = []
-        self.github_hook_ranges_v6: List[ipaddress.IPv6Network] = []
-        self.github_actions_ranges: List[ipaddress.IPv4Network] = []
-        self.github_actions_ranges_v6: List[ipaddress.IPv6Network] = []
-        
-        # GitLab IP ranges (hardcoded as per GitLab documentation)
-        self.gitlab_ranges: List[ipaddress.IPv4Network] = []
-        self._init_gitlab_ranges()
-        
-        self.last_updated = 0
-        self.cache_duration = 3600  # 1 hour in seconds
-        self.lock = threading.Lock()
-    
-    def _init_gitlab_ranges(self):
-        """Initialize GitLab IP ranges from their documented values"""
-        try:
-            self.gitlab_ranges = [
-                ipaddress.IPv4Network("34.74.90.64/28", strict=False),
-                ipaddress.IPv4Network("34.74.226.0/24", strict=False)
-            ]
-            logger.info(f"     Initialized GitLab IP ranges: {len(self.gitlab_ranges)} ranges")
-        except Exception as e:
-            logger.error(f"     Failed to initialize GitLab IP ranges: {e}")
-    
-    async def update_github_ranges(self):
-        """Fetch GitHub hook and actions IP ranges from the API"""
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get("https://api.github.com/meta", timeout=10.0)
-                response.raise_for_status()
-                data = response.json()
-                
-                hook_cidrs = data.get("hooks", [])
-                actions_cidrs = data.get("actions", [])
-                
-                hook_ranges_v4 = []
-                hook_ranges_v6 = []
-                actions_ranges_v4 = []
-                actions_ranges_v6 = []
-                
-                # Process hook IPs
-                for cidr in hook_cidrs:
-                    try:
-                        # Try IPv4 first
-                        if ':' not in cidr:
-                            hook_ranges_v4.append(ipaddress.IPv4Network(cidr, strict=False))
-                        else:
-                            hook_ranges_v6.append(ipaddress.IPv6Network(cidr, strict=False))
-                    except ValueError as e:
-                        logger.warning(f"Invalid CIDR range from GitHub API (hooks): {cidr} - {e}")
-                
-                # Process actions IPs
-                for cidr in actions_cidrs:
-                    try:
-                        # Try IPv4 first
-                        if ':' not in cidr:
-                            actions_ranges_v4.append(ipaddress.IPv4Network(cidr, strict=False))
-                        else:
-                            actions_ranges_v6.append(ipaddress.IPv6Network(cidr, strict=False))
-                    except ValueError as e:
-                        logger.warning(f"Invalid CIDR range from GitHub API (actions): {cidr} - {e}")
-                
-                with self.lock:
-                    self.github_hook_ranges = hook_ranges_v4
-                    self.github_hook_ranges_v6 = hook_ranges_v6
-                    self.github_actions_ranges = actions_ranges_v4
-                    self.github_actions_ranges_v6 = actions_ranges_v6
-                    self.last_updated = time.time()
-                
-                logger.info(f"     Updated GitHub IP ranges: hooks={len(hook_ranges_v4)} IPv4 + {len(hook_ranges_v6)} IPv6, actions={len(actions_ranges_v4)} IPv4 + {len(actions_ranges_v6)} IPv6")
-                return True
-                
-        except Exception as e:
-            logger.error(f"     Failed to fetch GitHub IP ranges: {e}")
-            return False
-    
-    async def is_vcs_ip(self, ip_str: str) -> bool:
-        """Check if an IP address is from a known VCS provider (GitHub or GitLab)"""
-        # Update cache if expired
-        if time.time() - self.last_updated > self.cache_duration:
-            await self.update_github_ranges()
-        
-        # Check if we have any ranges loaded
-        if not self.github_hook_ranges and not self.github_hook_ranges_v6 and not self.github_actions_ranges and not self.github_actions_ranges_v6 and not self.gitlab_ranges:
-            # If we don't have ranges loaded, allow all (fail open)
-            logger.warning("     No VCS IP ranges loaded, allowing request")
-            return True
-        
-        try:
-            # Try to parse as IPv4 first
-            if ':' not in ip_str:
-                ip = ipaddress.IPv4Address(ip_str)
-                with self.lock:
-                    # Check GitHub hook ranges
-                    for network in self.github_hook_ranges:
-                        if ip in network:
-                            return True
-                    # Check GitHub actions ranges
-                    for network in self.github_actions_ranges:
-                        if ip in network:
-                            return True
-                    # Check GitLab ranges
-                    for network in self.gitlab_ranges:
-                        if ip in network:
-                            return True
-            else:
-                # Parse as IPv6
-                ip = ipaddress.IPv6Address(ip_str)
-                with self.lock:
-                    # Check GitHub hook ranges
-                    for network in self.github_hook_ranges_v6:
-                        if ip in network:
-                            return True
-                    # Check GitHub actions ranges
-                    for network in self.github_actions_ranges_v6:
-                        if ip in network:
-                            return True
-                    # GitLab doesn't have IPv6 ranges documented
-            
-            return False
-            
-        except ValueError:
-            logger.warning(f"     Invalid IP address format: {ip_str}")
-            return False
 
 
 class ConnectionManager:
@@ -276,8 +27,6 @@ class ConnectionManager:
         self.hostname_to_subdomain: Dict[str, str] = {}
         self.subdomain_to_endpoint: Dict[str, str] = {}
         self.pending_requests: Dict[str, asyncio.Future] = {}
-        self.connection_start_times: Dict[str, float] = {}
-        self.validated_endpoints: Dict[str, bool] = {}  # Track validation state per subdomain
         self.domain = domain
         self.lock = threading.Lock()
 
@@ -290,12 +39,6 @@ class ConnectionManager:
         with self.lock:
             if subdomain in self.active_connections:
                 del self.active_connections[subdomain]
-            
-            if subdomain in self.connection_start_times:
-                del self.connection_start_times[subdomain]
-            
-            if subdomain in self.validated_endpoints:
-                del self.validated_endpoints[subdomain]
             
             if subdomain in self.subdomain_to_endpoint:
                 del self.subdomain_to_endpoint[subdomain]
@@ -370,10 +113,15 @@ class ConnectionManager:
 
 app = FastAPI(title="Tunnel Server")
 manager = None
-vcs_validator = None
-domain_validator = None
-vcs_only_mode = False
-domain_validation_mode = False
+db = None
+
+# Include auth routes if OAuth is configured
+@app.on_event("startup")
+async def startup_event():
+    if Config.has_github_oauth():
+        app.include_router(auth_router)
+    # Always include API routes
+    app.include_router(api_router)
 
 
 @app.websocket("/ws")
@@ -381,6 +129,10 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     subdomain = None
     hostname = None
+    connection_id = str(uuid.uuid4())
+    user_id = None
+    api_key_id = None
+    username = None
     
     try:
         # Wait for client info first
@@ -396,6 +148,26 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=1008, reason="Missing local_endpoint")
             return
         
+        # Authenticate using middleware
+        if auth_middleware:
+            auth_result = await auth_middleware.authenticate_websocket(websocket, client_info)
+            if auth_result is None:
+                # WebSocket was closed by middleware
+                return
+            user_id, api_key_id = auth_result
+            
+            if user_id:
+                # Check user tunnel limit
+                if not auth_middleware.check_user_tunnel_limit(user_id, manager.active_connections):
+                    await websocket.close(code=1008, reason="Tunnel limit reached")
+                    return
+                
+                # Get user info for logging
+                user = db.get_user_by_id(user_id)
+                if user:
+                    username = user['provider_username']
+                    logger.info(f"     Authenticated tunnel creation for user: {username} (ID: {user_id})")
+        
         # Generate subdomain and complete connection FIRST
         subdomain = manager.generate_subdomain()
         hostname = f"{subdomain}.{manager.domain}"
@@ -404,9 +176,25 @@ async def websocket_endpoint(websocket: WebSocket):
             manager.active_connections[subdomain] = websocket
             manager.hostname_to_subdomain[hostname] = subdomain
             manager.subdomain_to_endpoint[subdomain] = local_endpoint
-            manager.connection_start_times[subdomain] = time.time()
         
         logger.info(f"     WebSocket client connected: {hostname} -> {local_endpoint}")
+        
+        # Log connection to database
+        if db:
+            client_headers = dict(websocket.headers)
+            client_ip = websocket.client.host if websocket.client else None
+            user_agent = client_headers.get("user-agent")
+            db.log_connection(
+                subdomain=subdomain,
+                hostname=hostname,
+                local_endpoint=local_endpoint,
+                client_ip=client_ip,
+                user_agent=user_agent,
+                connection_id=connection_id,
+                user_id=user_id,
+                username=username,
+                api_key_id=api_key_id
+            )
         
         # Send hostname assignment immediately
         await websocket.send_text(json.dumps({
@@ -453,6 +241,9 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         if subdomain:
             manager.disconnect(subdomain)
+            # Log disconnection to database
+            if db:
+                db.log_disconnection(subdomain, connection_id)
 
 
 @app.get("/_health")
@@ -461,20 +252,11 @@ async def health_check():
 
 
 @app.get("/_admin", response_class=HTMLResponse)
-async def admin_dashboard(request: Request):
-    """Admin dashboard - protected by API key"""
-    # Check for admin API key
-    admin_key = os.getenv("TERRATUNNEL_ADMIN_KEY")
-    if admin_key:
-        # Check header
-        provided_key = request.headers.get("x-admin-key")
-        # Also check query parameter for browser access
-        if not provided_key:
-            provided_key = request.query_params.get("key")
-        
-        if provided_key != admin_key:
-            logger.warning(f"Admin access denied - invalid key")
-            raise HTTPException(403, "Access denied - invalid admin key")
+async def admin_dashboard(request: Request, current_user = Depends(require_admin_user)):
+    """Admin dashboard - protected by OAuth authentication"""
+    # If require_admin_user returns a RedirectResponse, return it
+    if isinstance(current_user, RedirectResponse):
+        return current_user
     
     # Gather tunnel data
     tunnels = []
@@ -580,6 +362,13 @@ async def admin_dashboard(request: Request):
                 font-size: 0.9em;
                 color: #666;
             }}
+            code {{
+                font-family: monospace;
+                font-size: 0.9em;
+                background: #f0f0f0;
+                padding: 2px 4px;
+                border-radius: 3px;
+            }}
             .refresh {{
                 margin-top: 20px;
                 text-align: center;
@@ -610,8 +399,7 @@ async def admin_dashboard(request: Request):
                 <h1>🚇 Terratunnel Admin</h1>
                 <div class="settings">
                     Domain: {manager.domain} | 
-                    VCS-only: {'✓' if vcs_only_mode else '✗'} |
-                    Validation: {'✓' if domain_validation_mode else '✗'}
+                    User: {current_user['username']} ({current_user['provider']})
                 </div>
             </div>
             
@@ -673,6 +461,49 @@ async def admin_dashboard(request: Request):
     else:
         html += '<div class="empty">No active tunnels</div>'
     
+    # Add recent connections section
+    if db:
+        recent_connections = db.get_recent_connections(limit=10)
+        if recent_connections:
+            html += """
+            
+            <h2 style="margin-top: 40px;">Recent Connections</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Timestamp</th>
+                        <th>Tunnel ID</th>
+                        <th>Hostname</th>
+                        <th>User</th>
+                        <th>Local Endpoint</th>
+                        <th>Client IP</th>
+                    </tr>
+                </thead>
+                <tbody>
+            """
+            for conn in recent_connections:
+                timestamp = conn['timestamp']
+                subdomain = conn['subdomain']
+                hostname = conn['hostname']
+                username = conn.get('username') or 'anonymous'
+                endpoint = conn['local_endpoint']
+                client_ip = conn['client_ip'] or 'N/A'
+                
+                html += f"""
+                    <tr>
+                        <td>{timestamp}</td>
+                        <td><code>{subdomain}</code></td>
+                        <td><span class="endpoint">{hostname}</span></td>
+                        <td>{username}</td>
+                        <td><span class="endpoint">{endpoint}</span></td>
+                        <td>{client_ip}</td>
+                    </tr>
+                """
+            html += """
+                </tbody>
+            </table>
+            """
+    
     html += """
             
             <div class="refresh">
@@ -687,20 +518,11 @@ async def admin_dashboard(request: Request):
 
 
 @app.get("/_admin/api/tunnels")
-async def admin_api_tunnels(request: Request):
+async def admin_api_tunnels(request: Request, current_user = Depends(require_admin_user)):
     """Admin API endpoint - returns JSON data"""
-    # Check for admin API key
-    admin_key = os.getenv("TERRATUNNEL_ADMIN_KEY")
-    if admin_key:
-        # Check header
-        provided_key = request.headers.get("x-admin-key")
-        # Also check query parameter
-        if not provided_key:
-            provided_key = request.query_params.get("key")
-        
-        if provided_key != admin_key:
-            logger.warning(f"Admin API access denied - invalid key")
-            raise HTTPException(403, "Access denied - invalid admin key")
+    # If require_admin_user returns a RedirectResponse, convert to 401
+    if isinstance(current_user, RedirectResponse):
+        raise HTTPException(status_code=401, detail="Authentication required")
     
     tunnels = {}
     with manager.lock:
@@ -719,41 +541,31 @@ async def admin_api_tunnels(request: Request):
             "websocket_connections": len(manager.active_connections)
         },
         "config": {
-            "domain": manager.domain,
-            "vcs_only": vcs_only_mode,
-            "validation_required": domain_validation_mode
+            "domain": manager.domain
         }
+    }
+
+
+@app.get("/_admin/api/audit")
+async def admin_api_audit(request: Request, current_user = Depends(require_admin_user), limit: int = 100):
+    """Admin API endpoint - returns audit log data"""
+    # If require_admin_user returns a RedirectResponse, convert to 401
+    if isinstance(current_user, RedirectResponse):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    if not db:
+        return {"error": "Database not initialized"}
+    
+    recent_connections = db.get_recent_connections(limit=limit)
+    
+    return {
+        "connections": recent_connections,
+        "total": len(recent_connections)
     }
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy_request(request: Request, path: str):
-    # VCS IP validation if enabled
-    if vcs_only_mode and vcs_validator:
-        # Check if this is a work manifest path that should bypass IP validation
-        # Pattern: /api/*/v1/work-manifests/{uuid}/*
-        # Self-hosted CI/CD runners don't have GitHub/GitLab/etc IPs
-        work_manifest_pattern = r'^api/[^/]+/v1/work-manifests/[a-f0-9\-]{36}/.*$'
-        
-        if re.match(work_manifest_pattern, path):
-            logger.info(f"     Bypassing IP validation for work manifest path: /{path}")
-        else:
-            client_ip = request.client.host if request.client else "unknown"
-            
-            # Check X-Forwarded-For header first (common in reverse proxy setups)
-            forwarded_for = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-            if forwarded_for:
-                client_ip = forwarded_for
-            
-            # Real IP header (some proxy configurations)
-            real_ip = request.headers.get("x-real-ip", "").strip()
-            if real_ip:
-                client_ip = real_ip
-            
-            if not await vcs_validator.is_vcs_ip(client_ip):
-                logger.warning(f"     Blocked non-VCS IP: {client_ip}")
-                raise HTTPException(status_code=403, detail="Access denied: Not a VCS provider IP")
-    
     host_header = request.headers.get("host", "")
     
     if not host_header:
@@ -765,101 +577,6 @@ async def proxy_request(request: Request, path: str):
     subdomain = manager.get_subdomain_from_hostname(hostname)
     if not subdomain:
         raise HTTPException(status_code=404, detail=f"Hostname {hostname} not found")
-    
-    # Endpoint validation if enabled (for long-lived connections)
-    if domain_validation_mode and domain_validator:
-        local_endpoint = manager.get_endpoint_from_subdomain(subdomain)
-        if local_endpoint:
-            # Check if we need to revalidate for long-lived connections
-            with manager.lock:
-                connection_start = manager.connection_start_times.get(subdomain, time.time())
-            
-            # Parse endpoint to get validation format
-            try:
-                from urllib.parse import urlparse
-                parsed_endpoint = urlparse(local_endpoint)
-                validation_host = parsed_endpoint.hostname or 'localhost'
-                validation_port = parsed_endpoint.port or (443 if parsed_endpoint.scheme == 'https' else 80)
-                validation_endpoint = f"{validation_host}:{validation_port}"
-                
-                # Skip revalidation for local endpoints
-                host_part = validation_endpoint.split(':')[0] if ':' in validation_endpoint else validation_endpoint
-                is_local = (
-                    host_part in ['localhost', '127.0.0.1', '::1'] or 
-                    host_part.startswith('192.168.') or 
-                    host_part.startswith('10.') or 
-                    host_part.startswith('172.') or
-                    host_part.startswith('169.254.') or
-                    host_part.startswith('fc00:') or
-                    host_part.startswith('fe80:')
-                )
-                
-                if not is_local and domain_validator.should_revalidate(validation_endpoint, connection_start):
-                    logger.info(f"     Re-validating endpoint for long-lived connection: {validation_endpoint}")
-                    if not await domain_validator.validate_domain(validation_endpoint):
-                        logger.warning(f"     Endpoint validation failed on revalidation: {validation_endpoint}")
-                        raise HTTPException(status_code=403, detail="Endpoint validation failed")
-            except Exception as e:
-                logger.warning(f"     Failed to parse endpoint URL for revalidation {local_endpoint}: {e}")
-    
-    # Check if this subdomain has been validated (first request validation)
-    if domain_validation_mode and domain_validator:
-        with manager.lock:
-            validated = manager.validated_endpoints.get(subdomain, False)
-        
-        if not validated:
-            local_endpoint = manager.get_endpoint_from_subdomain(subdomain)
-            if local_endpoint:
-                # Parse endpoint to get validation format
-                try:
-                    from urllib.parse import urlparse
-                    parsed_endpoint = urlparse(local_endpoint)
-                    validation_host = parsed_endpoint.hostname or 'localhost'
-                    validation_port = parsed_endpoint.port or (443 if parsed_endpoint.scheme == 'https' else 80)
-                    validation_endpoint = f"{validation_host}:{validation_port}"
-                    
-                    # Skip validation for local endpoints
-                    host_part = validation_endpoint.split(':')[0] if ':' in validation_endpoint else validation_endpoint
-                    is_local = (
-                        host_part in ['localhost', '127.0.0.1', '::1'] or 
-                        host_part.startswith('192.168.') or 
-                        host_part.startswith('10.') or 
-                        host_part.startswith('172.') or
-                        host_part.startswith('169.254.') or
-                        host_part.startswith('fc00:') or
-                        host_part.startswith('fe80:')
-                    )
-                    
-                    if not is_local:
-                        logger.info(f"     Performing first-request validation for: {validation_endpoint}")
-                        
-                        # Validation with retry logic
-                        max_retries = 3
-                        retry_delay = 1.0
-                        validation_success = False
-                        
-                        for attempt in range(max_retries + 1):
-                            if await domain_validator.validate_domain(validation_endpoint):
-                                validation_success = True
-                                logger.info(f"     First-request validation successful: {validation_endpoint}")
-                                break
-                            elif attempt < max_retries:
-                                logger.warning(f"     Validation attempt {attempt + 1}/{max_retries + 1} failed for {validation_endpoint}")
-                                logger.info(f"     Retrying validation in {retry_delay} seconds...")
-                                await asyncio.sleep(retry_delay)
-                                retry_delay *= 2  # Exponential backoff
-                        
-                        if not validation_success:
-                            logger.error(f"     First-request validation failed after {max_retries + 1} attempts: {validation_endpoint}")
-                            raise HTTPException(status_code=403, detail="Endpoint validation failed")
-                    
-                    # Mark as validated
-                    with manager.lock:
-                        manager.validated_endpoints[subdomain] = True
-                        
-                except Exception as e:
-                    logger.warning(f"     Failed to parse endpoint URL for validation {local_endpoint}: {e}")
-                    # Continue anyway - don't block on parsing errors
     
     body = await request.body()
     
@@ -894,43 +611,35 @@ async def proxy_request(request: Request, path: str):
     )
 
 
-async def init_vcs_validator():
-    """Initialize VCS IP validator and fetch initial ranges"""
-    global vcs_validator
-    vcs_validator = VCSIPValidator()
-    await vcs_validator.update_github_ranges()
-
-
-async def init_domain_validator():
-    """Initialize domain validator"""
-    global domain_validator
-    domain_validator = DomainValidator()
-
-
-def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.terrateam.dev", vcs_only: bool = False, validate_endpoint: bool = False):
-    global manager, vcs_only_mode, domain_validation_mode
+def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.terrateam.dev", vcs_only: bool = False, validate_endpoint: bool = False, db_path: Optional[str] = None):
+    global manager, db, auth_middleware
     manager = ConnectionManager(domain)
-    vcs_only_mode = vcs_only
-    domain_validation_mode = validate_endpoint
     
-    # Build feature flags for logging
-    features = []
-    if vcs_only:
-        features.append("VCS webhooks only (GitHub/GitLab)")
-        # Initialize VCS validator synchronously
-        asyncio.run(init_vcs_validator())
+    # Validate configuration
+    Config.validate()
     
-    if validate_endpoint:
-        features.append("endpoint validation")
-        # Initialize domain validator synchronously
-        asyncio.run(init_domain_validator())
-    
-    if features:
-        feature_str = " (" + ", ".join(features) + ")"
+    # Initialize database if path provided
+    if db_path:
+        db = Database(db_path)
     else:
-        feature_str = ""
+        db = Database()  # Uses default terratunnel.db
     
-    logger.info(f"     Starting tunnel server on {host}:{port} with domain {domain}{feature_str}")
+    # Initialize auth middleware
+    auth_middleware = AuthMiddleware(db)
+    
+    # Log OAuth configuration status
+    if Config.has_github_oauth():
+        logger.info(f"     GitHub OAuth enabled (redirect URI: {Config.get_github_oauth_redirect_uri(domain)})") 
+    else:
+        logger.info("     GitHub OAuth not configured (set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET to enable)")
+    
+    # Log authentication requirement status
+    if Config.REQUIRE_AUTH_FOR_TUNNELS:
+        logger.info("     Authentication required for tunnel creation (default)")
+    else:
+        logger.info("     Authentication not required for tunnel creation (WARNING: Not recommended for production)")
+    
+    logger.info(f"     Starting tunnel server on {host}:{port} with domain {domain}")
     
     # Configure uvicorn with custom logging
     uvicorn.run(

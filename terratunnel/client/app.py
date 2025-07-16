@@ -24,9 +24,10 @@ logger = logging.getLogger("terratunnel-client")
 
 
 class TunnelClient:
-    def __init__(self, server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False):
+    def __init__(self, server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False, api_key: Optional[str] = None):
         self.server_url = server_url
         self.local_endpoint = local_endpoint
+        self.api_key = api_key
         self.assigned_hostname = None
         self.subdomain = None
         self.websocket = None
@@ -67,6 +68,11 @@ class TunnelClient:
                 "type": "client_info",
                 "local_endpoint": self.local_endpoint
             }
+            
+            # Include API key if provided
+            if self.api_key:
+                endpoint_info["api_key"] = self.api_key
+            
             await self.websocket.send(json.dumps(endpoint_info))
             
             # Wait for hostname assignment with timeout
@@ -1180,10 +1186,10 @@ class TunnelClient:
         '''
 
 
-async def main_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False):
+async def main_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False, api_key: Optional[str] = None):
     logger.info(f"Starting tunnel client - local endpoint: {local_endpoint}")
     
-    client = TunnelClient(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook)
+    client = TunnelClient(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key)
     servers = []
     server_tasks = []
     
@@ -1309,9 +1315,9 @@ async def main_client(server_url: str, local_endpoint: str, dashboard: bool = Fa
                 pass
 
 
-def run_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False):
+def run_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False, api_key: Optional[str] = None):
     try:
-        asyncio.run(main_client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook))
+        asyncio.run(main_client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key))
     except KeyboardInterrupt:
         logger.info("Stopping tunnel client...")
     except Exception as e:

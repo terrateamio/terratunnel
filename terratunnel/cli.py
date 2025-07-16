@@ -25,14 +25,11 @@ def cli(log_level):
               help="Port to bind (default: 8000, env: TERRATUNNEL_PORT)")
 @click.option("--domain", default="tunnel.terrateam.dev", envvar="TERRATUNNEL_DOMAIN",
               help="Domain name for tunnel hostnames (default: tunnel.terrateam.dev, env: TERRATUNNEL_DOMAIN)")
-@click.option("--vcs-only", "--github-only", "vcs_only", is_flag=True, 
-              envvar=["TERRATUNNEL_VCS_ONLY", "TERRATUNNEL_GITHUB_ONLY"],
-              help="Only allow requests from VCS provider IPs (GitHub, GitLab) (env: TERRATUNNEL_VCS_ONLY or TERRATUNNEL_GITHUB_ONLY)")
-@click.option("--validate-endpoint", is_flag=True, envvar="TERRATUNNEL_VALIDATE_ENDPOINT",
-              help="Validate endpoint ownership via .well-known/terratunnel (env: TERRATUNNEL_VALIDATE_ENDPOINT)")
-def server(host, port, domain, vcs_only, validate_endpoint):
+@click.option("--db-path", default="terratunnel.db", envvar="TERRATUNNEL_DB_PATH",
+              help="Path to SQLite database file (default: terratunnel.db, env: TERRATUNNEL_DB_PATH)")
+def server(host, port, domain, db_path):
     """Start a tunnel server."""
-    run_server(host=host, port=port, domain=domain, vcs_only=vcs_only, validate_endpoint=validate_endpoint)
+    run_server(host=host, port=port, domain=domain, db_path=db_path)
 
 
 @cli.command()
@@ -48,9 +45,11 @@ def server(host, port, domain, vcs_only, validate_endpoint):
               help="Port for JSON API (default: 8081, env: TERRATUNNEL_API_PORT)")
 @click.option("--update-github-webhook", is_flag=True, envvar="TERRATUNNEL_UPDATE_GITHUB_WEBHOOK",
               help="Automatically update GitHub App webhook URL when tunnel connects (env: TERRATUNNEL_UPDATE_GITHUB_WEBHOOK)")
-def client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook):
+@click.option("--api-key", envvar="TERRATUNNEL_API_KEY",
+              help="API key for authentication (env: TERRATUNNEL_API_KEY)")
+def client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key):
     """Connect to a tunnel server and forward requests to a local endpoint."""
-    run_client(server_url=server_url, local_endpoint=local_endpoint, dashboard=dashboard, dashboard_port=dashboard_port, api_port=api_port, update_github_webhook=update_github_webhook)
+    run_client(server_url=server_url, local_endpoint=local_endpoint, dashboard=dashboard, dashboard_port=dashboard_port, api_port=api_port, update_github_webhook=update_github_webhook, api_key=api_key)
 
 
 if __name__ == "__main__":
