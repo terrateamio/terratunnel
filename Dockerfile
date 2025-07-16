@@ -48,7 +48,8 @@ COPY --from=builder /install /usr/local/lib/python3.11/site-packages
 COPY --from=builder /app/terratunnel /app/terratunnel
 
 # Copy static assets
-COPY logo.svg /app/logo.svg
+COPY logo-wordmark.svg /app/logo-wordmark.svg
+COPY logo-symbol.svg /app/logo-symbol.svg
 COPY fonts/ /app/fonts/
 
 # Set Python path to include the app directory
