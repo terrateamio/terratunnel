@@ -16,10 +16,10 @@ primary_region = 'iad'
   TERRATUNNEL_HOST = '0.0.0.0'
   TERRATUNNEL_PORT = '8000'
   TERRATUNNEL_DOMAIN = 'tunnel.terrateam.dev'
-  TERRATUNNEL_VCS_ONLY = 'true'
   TERRATUNNEL_LOG_LEVEL = 'INFO'
-  TERRATUNNEL_VALIDATE_ENDPOINT = 'true'
-  # TERRATUNNEL_ADMIN_KEY = 'set-via-fly-secrets'
+  JWT_ALGORITHM = 'HS256'
+  JWT_EXPIRATION_HOURS = '24'
+  TERRATUNNEL_GITHUB_ADMIN_USERS = 'joshpollara'
 
 [http_service]
   internal_port = 8000
