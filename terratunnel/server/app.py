@@ -114,14 +114,7 @@ class ConnectionManager:
 app = FastAPI(title="Tunnel Server")
 manager = None
 db = None
-
-# Include auth routes if OAuth is configured
-@app.on_event("startup")
-async def startup_event():
-    if Config.has_github_oauth():
-        app.include_router(auth_router)
-    # Always include API routes
-    app.include_router(api_router)
+auth_middleware = None
 
 
 @app.websocket("/ws")
@@ -566,6 +559,10 @@ async def admin_api_audit(request: Request, current_user = Depends(require_admin
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy_request(request: Request, path: str):
+    # Skip internal routes
+    if path.startswith("_admin") or path.startswith("_health") or path.startswith("auth/") or path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="Not found")
+    
     host_header = request.headers.get("host", "")
     
     if not host_header:
@@ -626,6 +623,13 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.te
     
     # Initialize auth middleware
     auth_middleware = AuthMiddleware(db)
+    
+    # Include routers BEFORE starting the server
+    # This ensures admin routes are registered before the catch-all proxy route
+    if Config.has_github_oauth():
+        app.include_router(auth_router)
+    # Always include API routes
+    app.include_router(api_router)
     
     # Log OAuth configuration status
     if Config.has_github_oauth():
