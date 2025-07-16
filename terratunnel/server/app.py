@@ -416,7 +416,7 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         <body>
             <div class="header">
                 <div class="header-content">
-                    <div class="logo"><img src="/logo-symbol.svg" alt="Terratunnel" style="height: 24px; vertical-align: middle; margin-right: 8px;">Terratunnel</div>
+                    <div class="logo"><img src="/logo-symbol.svg" alt="Terratunnel" style="height: 48px; vertical-align: middle; margin-right: 8px;">Terratunnel</div>
                     <div class="user-info">
                         <span>Signed in as <strong>{user['username']}</strong> ({user['provider']})</span>
                         <a href="/auth/logout?redirect_uri=/" class="logout-link">Sign out</a>
@@ -892,7 +892,7 @@ async def generate_api_key(request: Request, auth_token: Optional[str] = Cookie(
         <body>
             <div class="header">
                 <div class="header-content">
-                    <div class="logo"><img src="/logo-symbol.svg" alt="Terratunnel" style="height: 24px; vertical-align: middle; margin-right: 8px;">Terratunnel</div>
+                    <div class="logo"><img src="/logo-symbol.svg" alt="Terratunnel" style="height: 48px; vertical-align: middle; margin-right: 8px;">Terratunnel</div>
                 </div>
             </div>
             
@@ -1165,7 +1165,7 @@ async def admin_dashboard(request: Request, current_user = Depends(require_admin
     <body>
         <div class="container">
             <div class="header">
-                <h1><img src="/logo-symbol.svg" alt="Terratunnel" style="height: 32px; vertical-align: middle; margin-right: 8px;">Terratunnel Admin</h1>
+                <h1><img src="/logo-symbol.svg" alt="Terratunnel" style="height: 64px; vertical-align: middle; margin-right: 8px;">Terratunnel Admin</h1>
                 <div class="settings">
                     Domain: {manager.domain} | 
                     User: {current_user['username']} ({current_user['provider']})
