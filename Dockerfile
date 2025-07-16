@@ -37,6 +37,9 @@ ENV PYTHONUNBUFFERED=1 \
 # Create non-root user for security
 RUN addgroup -S terratunnel && adduser -S terratunnel -G terratunnel
 
+# Create data directory for persistent storage
+RUN mkdir -p /data && chown terratunnel:terratunnel /data
+
 # Install runtime dependencies only
 RUN apk add --no-cache libffi
 

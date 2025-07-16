@@ -20,6 +20,7 @@ primary_region = 'iad'
   JWT_ALGORITHM = 'HS256'
   JWT_EXPIRATION_HOURS = '24'
   TERRATUNNEL_GITHUB_ADMIN_USERS = 'joshpollara'
+  TERRATUNNEL_DB_PATH = '/data/terratunnel.db'
 
 [http_service]
   internal_port = 8000
@@ -74,3 +75,7 @@ primary_region = 'iad'
   memory = '256mb'
   cpu_kind = 'shared'
   cpus = 1
+
+[mounts]
+  source = 'terratunnel_data'
+  destination = '/data'
