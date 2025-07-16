@@ -206,7 +206,7 @@ async def github_oauth_callback(
 async def login_page(request: Request, redirect_uri: Optional[str] = None):
     """Simple login page with GitHub OAuth button"""
     if not Config.has_github_oauth():
-        return HTMLResponse("<h1>OAuth not configured</h1><p>GitHub OAuth is not configured on this server.</p>")
+        return HTMLResponse("<h1>OAuth not configured</h1><p>GitHub OAuth is not configured on this server.</p>", status_code=503)
     
     # Build the GitHub auth URL
     github_url = str(request.url_for("github_oauth_redirect"))

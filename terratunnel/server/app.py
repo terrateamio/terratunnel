@@ -116,6 +116,11 @@ manager = None
 db = None
 auth_middleware = None
 
+# Include routers immediately to ensure proper route registration order
+# The routers will check for configuration internally
+app.include_router(auth_router)
+app.include_router(api_router)
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -559,6 +564,10 @@ async def admin_api_audit(request: Request, current_user = Depends(require_admin
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy_request(request: Request, path: str):
+    # Skip if manager not initialized (during startup)
+    if not manager:
+        raise HTTPException(status_code=503, detail="Service starting up")
+    
     host_header = request.headers.get("host", "")
     
     if not host_header:
@@ -625,13 +634,6 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.te
     
     # Initialize auth middleware
     auth_middleware = AuthMiddleware(db)
-    
-    # Include routers BEFORE starting the server
-    # This ensures admin routes are registered before the catch-all proxy route
-    if Config.has_github_oauth():
-        app.include_router(auth_router)
-    # Always include API routes
-    app.include_router(api_router)
     
     # Log OAuth configuration status
     if Config.has_github_oauth():
