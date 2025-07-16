@@ -424,12 +424,10 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                                 <div class="api-key-name">{key['name'] or 'Unnamed key'}</div>
                                 <div class="api-key-created">Created on {created_date}</div>
                             </div>
-                            <form method="POST" action="/api/keys/{key['id']}/revoke" style="margin: 0;">
-                                <button type="submit" class="button button-danger" 
-                                    onclick="return confirm('Are you sure you want to revoke this API key?')">
-                                    Revoke
-                                </button>
-                            </form>
+                            <button class="button button-danger" 
+                                    onclick="if(confirm('Are you sure you want to revoke this API key?')) {{ fetch('/api/keys/{key['id']}/revoke', {{ method: 'POST', credentials: 'same-origin' }}).then(() => window.location.reload()); }} return false;">
+                                Revoke
+                            </button>
                         </div>
                 """
         else:
