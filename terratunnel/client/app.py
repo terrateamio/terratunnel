@@ -49,15 +49,26 @@ class TunnelClient:
         parsed = urlparse(server_url)
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
         self.ws_url = f"{ws_scheme}://{parsed.netloc}/ws"
-        self.local_url = local_endpoint
+        
+        # Ensure local endpoint has a protocol
+        if not local_endpoint.startswith(('http://', 'https://')):
+            self.local_url = f"http://{local_endpoint}"
+        else:
+            self.local_url = local_endpoint
 
     async def connect(self):
         try:
             logger.info(f"Connecting to tunnel server at {self.ws_url}...")
             
+            # Prepare headers with API key if provided
+            headers = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            
             # Add connection timeout and ping interval for better connection health monitoring
             self.websocket = await websockets.connect(
                 self.ws_url,
+                extra_headers=headers,
                 ping_interval=10,  # Send ping every 10 seconds
                 ping_timeout=20,   # Wait 20 seconds for pong
                 close_timeout=10   # Wait 10 seconds for close handshake
@@ -68,10 +79,6 @@ class TunnelClient:
                 "type": "client_info",
                 "local_endpoint": self.local_endpoint
             }
-            
-            # Include API key if provided
-            if self.api_key:
-                endpoint_info["api_key"] = self.api_key
             
             await self.websocket.send(json.dumps(endpoint_info))
             
@@ -98,6 +105,7 @@ class TunnelClient:
                 
                 logger.info(f"Tunnel ready! Access your local server at: https://{self.assigned_hostname}")
                 logger.info(f"Connected to tunnel server with hostname: {self.assigned_hostname}")
+                logger.info(f"Forwarding to local endpoint: {self.local_url}")
                 
                 # Automatically update GitHub webhook URL if flag is enabled and environment variables are set
                 if self.update_github_webhook and os.getenv("GITHUB_APP_ID") and os.getenv("GITHUB_APP_PEM"):
@@ -113,6 +121,19 @@ class TunnelClient:
                 
         except websockets.exceptions.InvalidURI:
             logger.error(f"Invalid WebSocket URL: {self.ws_url}")
+            return False
+        except websockets.exceptions.InvalidStatusCode as e:
+            if e.status_code == 401:
+                logger.error("Invalid API key - authentication failed")
+            else:
+                logger.error(f"WebSocket connection failed with status {e.status_code}")
+            return False
+        except websockets.exceptions.ConnectionClosedError as e:
+            # Handle policy violation (1008) for authentication errors
+            if e.code == 1008 and "Authentication required" in str(e):
+                logger.error("Invalid API key - authentication failed")
+            else:
+                logger.error(f"WebSocket connection closed: {e}")
             return False
         except websockets.exceptions.WebSocketException as e:
             logger.error(f"WebSocket error during connection: {e}")
