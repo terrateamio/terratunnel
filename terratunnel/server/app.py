@@ -717,7 +717,8 @@ async def generate_api_key(request: Request, auth_token: Optional[str] = Cookie(
     
     # Generate API key
     if db:
-        api_key, key_prefix = db.create_api_key(user["id"], api_key_name)
+        api_key = db.create_api_key(user["id"], api_key_name)
+        key_prefix = api_key[:8]  # Extract prefix for display
         
         # Show the API key (only time it will be shown in full)
         html = f"""
