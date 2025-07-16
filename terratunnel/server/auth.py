@@ -15,6 +15,20 @@ from .database import Database
 # Create auth router
 auth_router = APIRouter(prefix="/auth", tags=["authentication"])
 
+# Global database instance (set by app.py)
+_db: Optional[Database] = None
+
+def set_database(db: Database):
+    """Set the global database instance"""
+    global _db
+    _db = db
+
+def get_database() -> Database:
+    """Get the global database instance"""
+    if _db is None:
+        raise RuntimeError("Database not initialized")
+    return _db
+
 # Store for OAuth state parameters (in production, use Redis or similar)
 oauth_states = {}
 
@@ -151,7 +165,7 @@ async def github_oauth_callback(
         github_user = user_response.json()
     
     # Create or update user in database
-    db = Database()  # This should be injected as a dependency in production
+    db = get_database()
     user_id = db.create_or_update_user(
         auth_provider="github",
         provider_user_id=str(github_user["id"]),
@@ -206,7 +220,7 @@ async def github_oauth_callback(
 async def login_page(request: Request, redirect_uri: Optional[str] = None):
     """Simple login page with GitHub OAuth button"""
     if not Config.has_github_oauth():
-        return HTMLResponse("<h1>OAuth not configured</h1><p>GitHub OAuth is not configured on this server.</p>")
+        return HTMLResponse("<h1>OAuth not configured</h1><p>GitHub OAuth is not configured on this server.</p>", status_code=503)
     
     # Build the GitHub auth URL
     github_url = str(request.url_for("github_oauth_redirect"))
@@ -307,7 +321,7 @@ async def get_current_user(request: Request):
         user_id = int(payload["sub"])
         
         # Get user from database
-        db = Database()
+        db = get_database()
         user = db.get_user_by_id(user_id)
         
         if not user:
@@ -338,7 +352,7 @@ async def get_current_user_from_cookie(request: Request, auth_token: Optional[st
         user_id = int(payload["sub"])
         
         # Get user from database
-        db = Database()
+        db = get_database()
         user = db.get_user_by_id(user_id)
         
         if not user:
@@ -372,6 +386,82 @@ async def require_admin_user(request: Request, auth_token: Optional[str] = Cooki
     
     # Check if user is admin
     if not Config.is_admin_user(user["provider"], user["username"]):
-        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+        # Return an HTML response for browser requests
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Access Denied - Terratunnel</title>
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    margin: 0;
+                    padding: 20px;
+                    background: #f5f5f5;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    min-height: 100vh;
+                }
+                .container {
+                    max-width: 500px;
+                    background: white;
+                    padding: 40px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    text-align: center;
+                }
+                h1 {
+                    color: #d73a49;
+                    margin-top: 0;
+                }
+                p {
+                    color: #666;
+                    line-height: 1.6;
+                    margin: 20px 0;
+                }
+                .user-info {
+                    background: #f8f9fa;
+                    padding: 15px;
+                    border-radius: 6px;
+                    margin: 20px 0;
+                    font-family: monospace;
+                    font-size: 0.9em;
+                }
+                a {
+                    color: #0066cc;
+                    text-decoration: none;
+                }
+                a:hover {
+                    text-decoration: underline;
+                }
+                .button {
+                    display: inline-block;
+                    padding: 10px 20px;
+                    background: #0066cc;
+                    color: white;
+                    border-radius: 6px;
+                    margin-top: 20px;
+                }
+                .button:hover {
+                    background: #0052a3;
+                    text-decoration: none;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🚫 Access Denied</h1>
+                <p>You must be an administrator to access this page.</p>
+                <div class="user-info">
+                    Logged in as: <strong>""" + user["username"] + """ (""" + user["provider"] + """)</strong>
+                </div>
+                <p>If you believe you should have access, please contact your administrator.</p>
+                <a href="/" class="button">Go Back</a>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html, status_code=403)
     
     return user

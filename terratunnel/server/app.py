@@ -8,13 +8,13 @@ import uuid
 import time
 import os
 from typing import Dict, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, Cookie
 from fastapi.responses import JSONResponse, Response, HTMLResponse, RedirectResponse
 import uvicorn
 from .database import Database
 from .config import Config
-from .auth import auth_router, require_admin_user
-from .api import api_router
+from .auth import auth_router, require_admin_user, set_database as set_auth_database
+from .api import api_router, set_database as set_api_database
 from .middleware import AuthMiddleware
 
 
@@ -115,6 +115,11 @@ app = FastAPI(title="Tunnel Server")
 manager = None
 db = None
 auth_middleware = None
+
+# Include routers immediately to ensure proper route registration order
+# The routers will check for configuration internally
+app.include_router(auth_router)
+app.include_router(api_router)
 
 
 @app.websocket("/ws")
@@ -239,6 +244,638 @@ async def websocket_endpoint(websocket: WebSocket):
                 db.log_disconnection(subdomain, connection_id)
 
 
+@app.get("/", response_class=HTMLResponse)
+async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
+    """Home page with login/dashboard"""
+    from .auth import get_current_user_from_cookie
+    
+    user = None
+    if auth_token:
+        try:
+            user = await get_current_user_from_cookie(request, auth_token)
+        except:
+            pass
+    
+    if user:
+        # User is logged in, show dashboard
+        # Get user's API keys
+        api_keys = []
+        if db:
+            api_keys = db.list_user_api_keys(user["id"])
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Terratunnel Dashboard</title>
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    margin: 0;
+                    padding: 0;
+                    background: #f5f5f5;
+                }}
+                .header {{
+                    background: white;
+                    border-bottom: 1px solid #e1e4e8;
+                    padding: 20px 0;
+                }}
+                .header-content {{
+                    max-width: 1200px;
+                    margin: 0 auto;
+                    padding: 0 20px;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                }}
+                .logo {{
+                    font-size: 24px;
+                    font-weight: bold;
+                    color: #333;
+                }}
+                .user-info {{
+                    display: flex;
+                    align-items: center;
+                    gap: 20px;
+                }}
+                .avatar {{
+                    width: 32px;
+                    height: 32px;
+                    border-radius: 50%;
+                }}
+                .container {{
+                    max-width: 1200px;
+                    margin: 40px auto;
+                    padding: 0 20px;
+                }}
+                .card {{
+                    background: white;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    padding: 30px;
+                    margin-bottom: 20px;
+                }}
+                h1, h2 {{
+                    margin-top: 0;
+                    color: #333;
+                }}
+                .api-keys {{
+                    margin-top: 30px;
+                }}
+                .api-key {{
+                    background: #f8f9fa;
+                    border: 1px solid #e1e4e8;
+                    border-radius: 6px;
+                    padding: 15px;
+                    margin-bottom: 15px;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                }}
+                .api-key-info {{
+                    flex: 1;
+                }}
+                .api-key-prefix {{
+                    font-family: monospace;
+                    font-weight: bold;
+                    color: #0066cc;
+                }}
+                .api-key-name {{
+                    color: #666;
+                    margin-top: 5px;
+                }}
+                .api-key-created {{
+                    color: #999;
+                    font-size: 0.9em;
+                    margin-top: 5px;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 10px 20px;
+                    background: #0066cc;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    text-decoration: none;
+                    cursor: pointer;
+                    font-size: 14px;
+                }}
+                .button:hover {{
+                    background: #0052a3;
+                }}
+                .button-danger {{
+                    background: #d73a49;
+                }}
+                .button-danger:hover {{
+                    background: #cb2431;
+                }}
+                .empty {{
+                    text-align: center;
+                    padding: 40px;
+                    color: #666;
+                }}
+                .code-block {{
+                    background: #f6f8fa;
+                    border: 1px solid #e1e4e8;
+                    border-radius: 6px;
+                    padding: 20px;
+                    margin-top: 20px;
+                    font-family: monospace;
+                    font-size: 0.9em;
+                    overflow-x: auto;
+                }}
+                .logout-link {{
+                    color: #666;
+                    text-decoration: none;
+                }}
+                .logout-link:hover {{
+                    text-decoration: underline;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <div class="header-content">
+                    <div class="logo">🚇 Terratunnel</div>
+                    <div class="user-info">
+                        <span>Signed in as <strong>{user['username']}</strong> ({user['provider']})</span>
+                        <a href="/auth/logout?redirect_uri=/" class="logout-link">Sign out</a>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="container">
+                <div class="card">
+                    <h1>API Keys</h1>
+                    <p>Use API keys to create tunnels programmatically. Include your API key in the Authorization header.</p>
+                    
+                    <a href="/api/keys/new" class="button">Generate New API Key</a>
+                    
+                    <div class="api-keys">
+        """
+        
+        if api_keys:
+            for key in api_keys:
+                created_date = key['created_at'].split('T')[0] if 'T' in key['created_at'] else key['created_at'].split()[0]
+                html += f"""
+                        <div class="api-key">
+                            <div class="api-key-info">
+                                <div class="api-key-prefix">{key['key_prefix']}...</div>
+                                <div class="api-key-name">{key['name'] or 'Unnamed key'}</div>
+                                <div class="api-key-created">Created on {created_date}</div>
+                            </div>
+                            <form method="POST" action="/api/keys/{key['id']}/revoke" style="margin: 0;">
+                                <button type="submit" class="button button-danger" 
+                                    onclick="return confirm('Are you sure you want to revoke this API key?')">
+                                    Revoke
+                                </button>
+                            </form>
+                        </div>
+                """
+        else:
+            html += """
+                        <div class="empty">
+                            <p>You don't have any API keys yet.</p>
+                        </div>
+            """
+        
+        html += """
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <h2>Quick Start</h2>
+                    <p>Create a tunnel using the Terratunnel client:</p>
+                    <div class="code-block">
+# Install Terratunnel
+pip install terratunnel
+
+# Set your API key
+export TERRATUNNEL_API_KEY=your_api_key_here
+
+# Create a tunnel to your local service
+terratunnel client --server https://tunnel.terrateam.dev --local-endpoint http://localhost:3000
+                    </div>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+    else:
+        # User is not logged in, show login page
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Terratunnel - Secure HTTP Tunneling</title>
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    margin: 0;
+                    padding: 0;
+                    background: #f5f5f5;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    min-height: 100vh;
+                }}
+                .container {{
+                    max-width: 500px;
+                    background: white;
+                    padding: 40px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    text-align: center;
+                }}
+                h1 {{
+                    margin-top: 0;
+                    color: #333;
+                }}
+                .logo {{
+                    font-size: 48px;
+                    margin-bottom: 20px;
+                }}
+                p {{
+                    color: #666;
+                    line-height: 1.6;
+                    margin: 20px 0;
+                }}
+                .github-button {{
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 10px;
+                    padding: 12px 24px;
+                    background: #24292e;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    text-decoration: none;
+                    font-size: 16px;
+                    margin-top: 20px;
+                    cursor: pointer;
+                }}
+                .github-button:hover {{
+                    background: #1a1e22;
+                }}
+                .features {{
+                    text-align: left;
+                    margin: 30px 0;
+                    padding: 20px;
+                    background: #f8f9fa;
+                    border-radius: 6px;
+                }}
+                .features ul {{
+                    margin: 10px 0;
+                    padding-left: 20px;
+                }}
+                .features li {{
+                    color: #666;
+                    margin: 5px 0;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="logo">🚇</div>
+                <h1>Welcome to Terratunnel</h1>
+                <p>Secure HTTP tunneling for webhook development and testing.</p>
+                
+                <div class="features">
+                    <strong>Features:</strong>
+                    <ul>
+                        <li>Expose local services to the internet</li>
+                        <li>Perfect for webhook development</li>
+                        <li>Secure WebSocket connections</li>
+                        <li>API key authentication</li>
+                        <li>Real-time request forwarding</li>
+                    </ul>
+                </div>
+                
+                <p>Sign in to get started with your API key.</p>
+                
+                <a href="/auth/github?redirect_uri=/" class="github-button">
+                    <svg height="20" width="20" viewBox="0 0 16 16" fill="white">
+                        <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+                    </svg>
+                    Sign in with GitHub
+                </a>
+            </div>
+        </body>
+        </html>
+        """
+    
+    return HTMLResponse(content=html)
+
+
+@app.get("/api/keys/new", response_class=HTMLResponse)
+async def new_api_key_page(request: Request, auth_token: Optional[str] = Cookie(None)):
+    """Page to generate a new API key"""
+    from .auth import get_current_user_from_cookie
+    
+    user = await get_current_user_from_cookie(request, auth_token)
+    if not user:
+        return RedirectResponse(url="/auth/github?redirect_uri=/api/keys/new", status_code=302)
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Generate API Key - Terratunnel</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                margin: 0;
+                padding: 0;
+                background: #f5f5f5;
+            }}
+            .header {{
+                background: white;
+                border-bottom: 1px solid #e1e4e8;
+                padding: 20px 0;
+            }}
+            .header-content {{
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 0 20px;
+            }}
+            .logo {{
+                font-size: 24px;
+                font-weight: bold;
+                color: #333;
+            }}
+            .container {{
+                max-width: 800px;
+                margin: 40px auto;
+                padding: 0 20px;
+            }}
+            .card {{
+                background: white;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                padding: 30px;
+            }}
+            h1 {{
+                margin-top: 0;
+                color: #333;
+            }}
+            .form-group {{
+                margin-bottom: 20px;
+            }}
+            label {{
+                display: block;
+                margin-bottom: 5px;
+                color: #333;
+                font-weight: 500;
+            }}
+            input[type="text"] {{
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #e1e4e8;
+                border-radius: 6px;
+                font-size: 14px;
+                box-sizing: border-box;
+            }}
+            input[type="text"]:focus {{
+                outline: none;
+                border-color: #0066cc;
+            }}
+            .help-text {{
+                font-size: 0.9em;
+                color: #666;
+                margin-top: 5px;
+            }}
+            .button {{
+                display: inline-block;
+                padding: 10px 20px;
+                background: #0066cc;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                text-decoration: none;
+                cursor: pointer;
+                font-size: 14px;
+            }}
+            .button:hover {{
+                background: #0052a3;
+            }}
+            .button-secondary {{
+                background: #6c757d;
+            }}
+            .button-secondary:hover {{
+                background: #5a6268;
+            }}
+            .buttons {{
+                display: flex;
+                gap: 10px;
+                margin-top: 20px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div class="header-content">
+                <div class="logo">🚇 Terratunnel</div>
+            </div>
+        </div>
+        
+        <div class="container">
+            <div class="card">
+                <h1>Generate New API Key</h1>
+                <form method="POST" action="/api/keys/generate">
+                    <div class="form-group">
+                        <label for="name">API Key Name (optional)</label>
+                        <input type="text" id="name" name="name" placeholder="e.g., Production Server, CI/CD Pipeline">
+                        <div class="help-text">Give your API key a name to help you remember what it's used for.</div>
+                    </div>
+                    
+                    <div class="buttons">
+                        <button type="submit" class="button">Generate API Key</button>
+                        <a href="/" class="button button-secondary">Cancel</a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html)
+
+
+@app.post("/api/keys/generate")
+async def generate_api_key(request: Request, auth_token: Optional[str] = Cookie(None)):
+    """Generate a new API key for the user"""
+    from .auth import get_current_user_from_cookie
+    
+    user = await get_current_user_from_cookie(request, auth_token)
+    if not user:
+        return RedirectResponse(url="/auth/github?redirect_uri=/api/keys/new", status_code=302)
+    
+    # Get form data
+    form_data = await request.form()
+    api_key_name = form_data.get("name", "").strip() or None
+    
+    # Generate API key
+    if db:
+        api_key, key_prefix = db.create_api_key(user["id"], api_key_name)
+        
+        # Show the API key (only time it will be shown in full)
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>API Key Generated - Terratunnel</title>
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    margin: 0;
+                    padding: 0;
+                    background: #f5f5f5;
+                }}
+                .header {{
+                    background: white;
+                    border-bottom: 1px solid #e1e4e8;
+                    padding: 20px 0;
+                }}
+                .header-content {{
+                    max-width: 800px;
+                    margin: 0 auto;
+                    padding: 0 20px;
+                }}
+                .logo {{
+                    font-size: 24px;
+                    font-weight: bold;
+                    color: #333;
+                }}
+                .container {{
+                    max-width: 800px;
+                    margin: 40px auto;
+                    padding: 0 20px;
+                }}
+                .card {{
+                    background: white;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    padding: 30px;
+                }}
+                h1 {{
+                    margin-top: 0;
+                    color: #333;
+                }}
+                .success-icon {{
+                    color: #28a745;
+                    font-size: 48px;
+                    margin-bottom: 20px;
+                }}
+                .api-key-display {{
+                    background: #f6f8fa;
+                    border: 1px solid #e1e4e8;
+                    border-radius: 6px;
+                    padding: 20px;
+                    margin: 20px 0;
+                    font-family: monospace;
+                    font-size: 16px;
+                    word-break: break-all;
+                    user-select: all;
+                }}
+                .warning {{
+                    background: #fff5b1;
+                    border: 1px solid #f0e68c;
+                    border-radius: 6px;
+                    padding: 15px;
+                    margin: 20px 0;
+                    color: #856404;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 10px 20px;
+                    background: #0066cc;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    text-decoration: none;
+                    cursor: pointer;
+                    font-size: 14px;
+                    margin-top: 20px;
+                }}
+                .button:hover {{
+                    background: #0052a3;
+                }}
+                .copy-button {{
+                    background: #6c757d;
+                    margin-left: 10px;
+                }}
+                .copy-button:hover {{
+                    background: #5a6268;
+                }}
+            </style>
+            <script>
+                function copyApiKey() {{
+                    const apiKey = document.getElementById('apiKey');
+                    apiKey.select();
+                    document.execCommand('copy');
+                    
+                    const button = document.getElementById('copyButton');
+                    button.textContent = 'Copied!';
+                    setTimeout(() => {{
+                        button.textContent = 'Copy';
+                    }}, 2000);
+                }}
+            </script>
+        </head>
+        <body>
+            <div class="header">
+                <div class="header-content">
+                    <div class="logo">🚇 Terratunnel</div>
+                </div>
+            </div>
+            
+            <div class="container">
+                <div class="card">
+                    <div class="success-icon">✅</div>
+                    <h1>API Key Generated Successfully!</h1>
+                    
+                    <p>Your new API key has been created{' with name "' + api_key_name + '"' if api_key_name else ''}.</p>
+                    
+                    <div class="api-key-display">
+                        <input type="text" id="apiKey" value="{api_key}" readonly style="width: 100%; border: none; background: none; font-family: monospace; font-size: 16px;">
+                    </div>
+                    
+                    <button class="button copy-button" id="copyButton" onclick="copyApiKey()">Copy</button>
+                    
+                    <div class="warning">
+                        <strong>⚠️ Important:</strong> This is the only time you'll see this API key. Make sure to copy it and store it securely. You won't be able to see it again.
+                    </div>
+                    
+                    <a href="/" class="button">Back to Dashboard</a>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html)
+    else:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+
+
+@app.post("/api/keys/{key_id}/revoke")
+async def revoke_api_key(key_id: int, request: Request, auth_token: Optional[str] = Cookie(None)):
+    """Revoke an API key"""
+    from .auth import get_current_user_from_cookie
+    
+    user = await get_current_user_from_cookie(request, auth_token)
+    if not user:
+        return RedirectResponse(url="/auth/github?redirect_uri=/", status_code=302)
+    
+    if db:
+        # Verify the key belongs to the user and revoke it
+        success = db.revoke_api_key(user["id"], key_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="API key not found")
+    
+    return RedirectResponse(url="/?revoked=true", status_code=302)
+
+
 @app.get("/_health")
 async def health_check():
     return {"status": "healthy", "active_connections": len(manager.active_connections)}
@@ -247,8 +884,8 @@ async def health_check():
 @app.get("/_admin", response_class=HTMLResponse)
 async def admin_dashboard(request: Request, current_user = Depends(require_admin_user)):
     """Admin dashboard - protected by OAuth authentication"""
-    # If require_admin_user returns a RedirectResponse, return it
-    if isinstance(current_user, RedirectResponse):
+    # If require_admin_user returns a RedirectResponse or HTMLResponse, return it
+    if isinstance(current_user, (RedirectResponse, HTMLResponse)):
         return current_user
     
     # Gather tunnel data
@@ -513,9 +1150,11 @@ async def admin_dashboard(request: Request, current_user = Depends(require_admin
 @app.get("/_admin/api/tunnels")
 async def admin_api_tunnels(request: Request, current_user = Depends(require_admin_user)):
     """Admin API endpoint - returns JSON data"""
-    # If require_admin_user returns a RedirectResponse, convert to 401
+    # If require_admin_user returns a RedirectResponse or HTMLResponse, convert to appropriate error
     if isinstance(current_user, RedirectResponse):
         raise HTTPException(status_code=401, detail="Authentication required")
+    if isinstance(current_user, HTMLResponse):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
     
     tunnels = {}
     with manager.lock:
@@ -542,9 +1181,11 @@ async def admin_api_tunnels(request: Request, current_user = Depends(require_adm
 @app.get("/_admin/api/audit")
 async def admin_api_audit(request: Request, current_user = Depends(require_admin_user), limit: int = 100):
     """Admin API endpoint - returns audit log data"""
-    # If require_admin_user returns a RedirectResponse, convert to 401
+    # If require_admin_user returns a RedirectResponse or HTMLResponse, convert to appropriate error
     if isinstance(current_user, RedirectResponse):
         raise HTTPException(status_code=401, detail="Authentication required")
+    if isinstance(current_user, HTMLResponse):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
     
     if not db:
         return {"error": "Database not initialized"}
@@ -559,6 +1200,10 @@ async def admin_api_audit(request: Request, current_user = Depends(require_admin
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy_request(request: Request, path: str):
+    # Skip if manager not initialized (during startup)
+    if not manager:
+        raise HTTPException(status_code=503, detail="Service starting up")
+    
     host_header = request.headers.get("host", "")
     
     if not host_header:
@@ -626,12 +1271,9 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.te
     # Initialize auth middleware
     auth_middleware = AuthMiddleware(db)
     
-    # Include routers BEFORE starting the server
-    # This ensures admin routes are registered before the catch-all proxy route
-    if Config.has_github_oauth():
-        app.include_router(auth_router)
-    # Always include API routes
-    app.include_router(api_router)
+    # Set database in auth and api modules
+    set_auth_database(db)
+    set_api_database(db)
     
     # Log OAuth configuration status
     if Config.has_github_oauth():
