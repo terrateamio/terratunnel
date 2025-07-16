@@ -386,6 +386,82 @@ async def require_admin_user(request: Request, auth_token: Optional[str] = Cooki
     
     # Check if user is admin
     if not Config.is_admin_user(user["provider"], user["username"]):
-        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+        # Return an HTML response for browser requests
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Access Denied - Terratunnel</title>
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    margin: 0;
+                    padding: 20px;
+                    background: #f5f5f5;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    min-height: 100vh;
+                }
+                .container {
+                    max-width: 500px;
+                    background: white;
+                    padding: 40px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    text-align: center;
+                }
+                h1 {
+                    color: #d73a49;
+                    margin-top: 0;
+                }
+                p {
+                    color: #666;
+                    line-height: 1.6;
+                    margin: 20px 0;
+                }
+                .user-info {
+                    background: #f8f9fa;
+                    padding: 15px;
+                    border-radius: 6px;
+                    margin: 20px 0;
+                    font-family: monospace;
+                    font-size: 0.9em;
+                }
+                a {
+                    color: #0066cc;
+                    text-decoration: none;
+                }
+                a:hover {
+                    text-decoration: underline;
+                }
+                .button {
+                    display: inline-block;
+                    padding: 10px 20px;
+                    background: #0066cc;
+                    color: white;
+                    border-radius: 6px;
+                    margin-top: 20px;
+                }
+                .button:hover {
+                    background: #0052a3;
+                    text-decoration: none;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🚫 Access Denied</h1>
+                <p>You must be an administrator to access this page.</p>
+                <div class="user-info">
+                    Logged in as: <strong>""" + user["username"] + """ (""" + user["provider"] + """)</strong>
+                </div>
+                <p>If you believe you should have access, please contact your administrator.</p>
+                <a href="/" class="button">Go Back</a>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html, status_code=403)
     
     return user

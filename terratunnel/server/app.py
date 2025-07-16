@@ -252,8 +252,8 @@ async def health_check():
 @app.get("/_admin", response_class=HTMLResponse)
 async def admin_dashboard(request: Request, current_user = Depends(require_admin_user)):
     """Admin dashboard - protected by OAuth authentication"""
-    # If require_admin_user returns a RedirectResponse, return it
-    if isinstance(current_user, RedirectResponse):
+    # If require_admin_user returns a RedirectResponse or HTMLResponse, return it
+    if isinstance(current_user, (RedirectResponse, HTMLResponse)):
         return current_user
     
     # Gather tunnel data
@@ -518,9 +518,11 @@ async def admin_dashboard(request: Request, current_user = Depends(require_admin
 @app.get("/_admin/api/tunnels")
 async def admin_api_tunnels(request: Request, current_user = Depends(require_admin_user)):
     """Admin API endpoint - returns JSON data"""
-    # If require_admin_user returns a RedirectResponse, convert to 401
+    # If require_admin_user returns a RedirectResponse or HTMLResponse, convert to appropriate error
     if isinstance(current_user, RedirectResponse):
         raise HTTPException(status_code=401, detail="Authentication required")
+    if isinstance(current_user, HTMLResponse):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
     
     tunnels = {}
     with manager.lock:
@@ -547,9 +549,11 @@ async def admin_api_tunnels(request: Request, current_user = Depends(require_adm
 @app.get("/_admin/api/audit")
 async def admin_api_audit(request: Request, current_user = Depends(require_admin_user), limit: int = 100):
     """Admin API endpoint - returns audit log data"""
-    # If require_admin_user returns a RedirectResponse, convert to 401
+    # If require_admin_user returns a RedirectResponse or HTMLResponse, convert to appropriate error
     if isinstance(current_user, RedirectResponse):
         raise HTTPException(status_code=401, detail="Authentication required")
+    if isinstance(current_user, HTMLResponse):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
     
     if not db:
         return {"error": "Database not initialized"}
