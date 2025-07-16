@@ -269,8 +269,26 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         <head>
             <title>Terratunnel Dashboard</title>
             <style>
+                @font-face {{
+                    font-family: 'Apertura';
+                    src: url('/fonts/Apertura_Regular.otf') format('opentype');
+                    font-weight: 400;
+                    font-style: normal;
+                }}
+                @font-face {{
+                    font-family: 'Apertura';
+                    src: url('/fonts/Apertura_Medium.otf') format('opentype');
+                    font-weight: 500;
+                    font-style: normal;
+                }}
+                @font-face {{
+                    font-family: 'Apertura';
+                    src: url('/fonts/Apertura_Bold.otf') format('opentype');
+                    font-weight: 700;
+                    font-style: normal;
+                }}
                 body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    font-family: 'Apertura', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                     margin: 0;
                     padding: 0;
                     background: #f5f5f5;
@@ -450,21 +468,6 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         html += """
                     </div>
                 </div>
-                
-                <div class="card">
-                    <h2>Quick Start</h2>
-                    <p>Create a tunnel using the Terratunnel client:</p>
-                    <div class="code-block">
-                        <div style="margin-bottom: 0.5em;"><span style="color: #666;"># Install Terratunnel</span></div>
-                        <div style="margin-bottom: 1em;">pip install terratunnel</div>
-                        
-                        <div style="margin-bottom: 0.5em;"><span style="color: #666;"># Set your API key</span></div>
-                        <div style="margin-bottom: 1em;">export TERRATUNNEL_API_KEY=your_api_key_here</div>
-                        
-                        <div style="margin-bottom: 0.5em;"><span style="color: #666;"># Create a tunnel to your local service</span></div>
-                        <div>terratunnel client --server https://tunnel.terrateam.dev --local-endpoint http://localhost:3000</div>
-                    </div>
-                </div>
             </div>
         </body>
         </html>
@@ -477,8 +480,26 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         <head>
             <title>Terratunnel - Secure HTTP Tunneling</title>
             <style>
+                @font-face {{
+                    font-family: 'Apertura';
+                    src: url('/fonts/Apertura_Regular.otf') format('opentype');
+                    font-weight: 400;
+                    font-style: normal;
+                }}
+                @font-face {{
+                    font-family: 'Apertura';
+                    src: url('/fonts/Apertura_Medium.otf') format('opentype');
+                    font-weight: 500;
+                    font-style: normal;
+                }}
+                @font-face {{
+                    font-family: 'Apertura';
+                    src: url('/fonts/Apertura_Bold.otf') format('opentype');
+                    font-weight: 700;
+                    font-style: normal;
+                }}
                 body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    font-family: 'Apertura', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                     margin: 0;
                     padding: 0;
                     background: #f5f5f5;
@@ -590,8 +611,26 @@ async def new_api_key_page(request: Request, auth_token: Optional[str] = Cookie(
     <head>
         <title>Generate API Key - Terratunnel</title>
         <style>
+            @font-face {{
+                font-family: 'Apertura';
+                src: url('/fonts/Apertura_Regular.otf') format('opentype');
+                font-weight: 400;
+                font-style: normal;
+            }}
+            @font-face {{
+                font-family: 'Apertura';
+                src: url('/fonts/Apertura_Medium.otf') format('opentype');
+                font-weight: 500;
+                font-style: normal;
+            }}
+            @font-face {{
+                font-family: 'Apertura';
+                src: url('/fonts/Apertura_Bold.otf') format('opentype');
+                font-weight: 700;
+                font-style: normal;
+            }}
             body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                font-family: 'Apertura', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                 margin: 0;
                 padding: 0;
                 background: #f5f5f5;
@@ -735,8 +774,26 @@ async def generate_api_key(request: Request, auth_token: Optional[str] = Cookie(
         <head>
             <title>API Key Generated - Terratunnel</title>
             <style>
+                @font-face {{
+                    font-family: 'Apertura';
+                    src: url('/fonts/Apertura_Regular.otf') format('opentype');
+                    font-weight: 400;
+                    font-style: normal;
+                }}
+                @font-face {{
+                    font-family: 'Apertura';
+                    src: url('/fonts/Apertura_Medium.otf') format('opentype');
+                    font-weight: 500;
+                    font-style: normal;
+                }}
+                @font-face {{
+                    font-family: 'Apertura';
+                    src: url('/fonts/Apertura_Bold.otf') format('opentype');
+                    font-weight: 700;
+                    font-style: normal;
+                }}
                 body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    font-family: 'Apertura', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                     margin: 0;
                     padding: 0;
                     background: #f5f5f5;
@@ -903,6 +960,25 @@ async def serve_logo():
         return Response(content=placeholder, media_type="image/svg+xml")
 
 
+@app.get("/fonts/{font_name}")
+async def serve_font(font_name: str):
+    """Serve font files"""
+    import os
+    fonts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "fonts")
+    font_path = os.path.join(fonts_dir, font_name)
+    
+    # Security check - ensure the path is within fonts directory
+    if not os.path.abspath(font_path).startswith(os.path.abspath(fonts_dir)):
+        raise HTTPException(status_code=404, detail="Font not found")
+    
+    if os.path.exists(font_path) and font_name.endswith('.otf'):
+        with open(font_path, "rb") as f:
+            font_content = f.read()
+        return Response(content=font_content, media_type="font/otf")
+    else:
+        raise HTTPException(status_code=404, detail="Font not found")
+
+
 @app.get("/_health")
 async def health_check():
     return {"status": "healthy", "active_connections": len(manager.active_connections)}
@@ -938,8 +1014,26 @@ async def admin_dashboard(request: Request, current_user = Depends(require_admin
     <head>
         <title>Terratunnel Admin</title>
         <style>
+            @font-face {{
+                font-family: 'Apertura';
+                src: url('/fonts/Apertura_Regular.otf') format('opentype');
+                font-weight: 400;
+                font-style: normal;
+            }}
+            @font-face {{
+                font-family: 'Apertura';
+                src: url('/fonts/Apertura_Medium.otf') format('opentype');
+                font-weight: 500;
+                font-style: normal;
+            }}
+            @font-face {{
+                font-family: 'Apertura';
+                src: url('/fonts/Apertura_Bold.otf') format('opentype');
+                font-weight: 700;
+                font-style: normal;
+            }}
             body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                font-family: 'Apertura', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                 margin: 0;
                 padding: 20px;
                 background: #f5f5f5;
