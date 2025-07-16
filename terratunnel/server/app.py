@@ -13,8 +13,8 @@ from fastapi.responses import JSONResponse, Response, HTMLResponse, RedirectResp
 import uvicorn
 from .database import Database
 from .config import Config
-from .auth import auth_router, require_admin_user
-from .api import api_router
+from .auth import auth_router, require_admin_user, set_database as set_auth_database
+from .api import api_router, set_database as set_api_database
 from .middleware import AuthMiddleware
 
 
@@ -634,6 +634,10 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.te
     
     # Initialize auth middleware
     auth_middleware = AuthMiddleware(db)
+    
+    # Set database in auth and api modules
+    set_auth_database(db)
+    set_api_database(db)
     
     # Log OAuth configuration status
     if Config.has_github_oauth():

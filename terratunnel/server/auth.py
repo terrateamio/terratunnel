@@ -15,6 +15,20 @@ from .database import Database
 # Create auth router
 auth_router = APIRouter(prefix="/auth", tags=["authentication"])
 
+# Global database instance (set by app.py)
+_db: Optional[Database] = None
+
+def set_database(db: Database):
+    """Set the global database instance"""
+    global _db
+    _db = db
+
+def get_database() -> Database:
+    """Get the global database instance"""
+    if _db is None:
+        raise RuntimeError("Database not initialized")
+    return _db
+
 # Store for OAuth state parameters (in production, use Redis or similar)
 oauth_states = {}
 
@@ -151,7 +165,7 @@ async def github_oauth_callback(
         github_user = user_response.json()
     
     # Create or update user in database
-    db = Database()  # This should be injected as a dependency in production
+    db = get_database()
     user_id = db.create_or_update_user(
         auth_provider="github",
         provider_user_id=str(github_user["id"]),
@@ -307,7 +321,7 @@ async def get_current_user(request: Request):
         user_id = int(payload["sub"])
         
         # Get user from database
-        db = Database()
+        db = get_database()
         user = db.get_user_by_id(user_id)
         
         if not user:
@@ -338,7 +352,7 @@ async def get_current_user_from_cookie(request: Request, auth_token: Optional[st
         user_id = int(payload["sub"])
         
         # Get user from database
-        db = Database()
+        db = get_database()
         user = db.get_user_by_id(user_id)
         
         if not user:

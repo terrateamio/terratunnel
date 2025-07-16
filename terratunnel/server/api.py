@@ -15,6 +15,20 @@ api_router = APIRouter(prefix="/api", tags=["api"])
 # Security scheme for API endpoints
 security = HTTPBearer()
 
+# Global database instance (set by app.py)
+_db: Optional[Database] = None
+
+def set_database(db: Database):
+    """Set the global database instance"""
+    global _db
+    _db = db
+
+def get_database() -> Database:
+    """Get the global database instance"""
+    if _db is None:
+        raise RuntimeError("Database not initialized")
+    return _db
+
 
 # Request/Response models
 class TokenExchangeRequest(BaseModel):
@@ -51,7 +65,7 @@ class UserInfo(BaseModel):
 
 async def get_current_user_from_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """Dependency to get current user from API key"""
-    db = Database()
+    db = get_database()
     api_key_info = db.validate_api_key(credentials.credentials)
     
     if not api_key_info:
@@ -90,7 +104,7 @@ async def exchange_github_token(request: TokenExchangeRequest):
             raise HTTPException(status_code=500, detail=f"Failed to connect to GitHub: {str(e)}")
     
     # Create or update user in database
-    db = Database()
+    db = get_database()
     
     try:
         user_id = db.create_or_update_user(
@@ -145,7 +159,7 @@ async def get_current_user_api(api_key_info: dict = Depends(get_current_user_fro
 async def list_api_keys(api_key_info: dict = Depends(get_current_user_from_api_key)):
     """List all API keys for the current user"""
     
-    db = Database()
+    db = get_database()
     keys = db.list_user_api_keys(api_key_info["user_id"])
     
     return [APIKeyInfo(**key) for key in keys]
@@ -159,7 +173,7 @@ async def revoke_api_key(key_id: int, api_key_info: dict = Depends(get_current_u
     if api_key_info["id"] == key_id:
         raise HTTPException(status_code=400, detail="Cannot revoke the API key currently in use")
     
-    db = Database()
+    db = get_database()
     if db.revoke_api_key(api_key_info["user_id"], key_id):
         return {"message": "API key revoked successfully"}
     else:
