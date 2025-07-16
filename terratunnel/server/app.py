@@ -380,9 +380,11 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                     border-radius: 6px;
                     padding: 20px;
                     margin-top: 20px;
-                    font-family: monospace;
-                    font-size: 0.9em;
+                    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                    font-size: 14px;
+                    line-height: 1.5;
                     overflow-x: auto;
+                    white-space: pre-wrap;
                 }}
                 .logout-link {{
                     color: #666;
@@ -453,14 +455,14 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                     <h2>Quick Start</h2>
                     <p>Create a tunnel using the Terratunnel client:</p>
                     <div class="code-block">
-# Install Terratunnel
-pip install terratunnel
-
-# Set your API key
-export TERRATUNNEL_API_KEY=your_api_key_here
-
-# Create a tunnel to your local service
-terratunnel client --server https://tunnel.terrateam.dev --local-endpoint http://localhost:3000
+                        <div style="margin-bottom: 0.5em;"><span style="color: #666;"># Install Terratunnel</span></div>
+                        <div style="margin-bottom: 1em;">pip install terratunnel</div>
+                        
+                        <div style="margin-bottom: 0.5em;"><span style="color: #666;"># Set your API key</span></div>
+                        <div style="margin-bottom: 1em;">export TERRATUNNEL_API_KEY=your_api_key_here</div>
+                        
+                        <div style="margin-bottom: 0.5em;"><span style="color: #666;"># Create a tunnel to your local service</span></div>
+                        <div>terratunnel client --server https://tunnel.terrateam.dev --local-endpoint http://localhost:3000</div>
                     </div>
                 </div>
             </div>
