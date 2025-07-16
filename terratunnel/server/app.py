@@ -559,10 +559,6 @@ async def admin_api_audit(request: Request, current_user = Depends(require_admin
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy_request(request: Request, path: str):
-    # Skip internal routes
-    if path.startswith("_admin") or path.startswith("_health") or path.startswith("auth/") or path.startswith("api/"):
-        raise HTTPException(status_code=404, detail="Not found")
-    
     host_header = request.headers.get("host", "")
     
     if not host_header:
@@ -571,9 +567,15 @@ async def proxy_request(request: Request, path: str):
     # Strip port from host header if present (e.g., "example.com:8000" -> "example.com")
     hostname = host_header.split(':')[0]
     
+    # Check if this is the main domain (not a subdomain) - skip proxy handling
+    # Main domain requests should be handled by app routes, not proxied
+    if hostname == manager.domain:
+        # This is the main domain, not a tunnel subdomain
+        raise HTTPException(status_code=404, detail="Not found")
+    
     subdomain = manager.get_subdomain_from_hostname(hostname)
     if not subdomain:
-        raise HTTPException(status_code=404, detail=f"Hostname {hostname} not found")
+        raise HTTPException(status_code=404, detail=f"Tunnel {hostname} not found")
     
     body = await request.body()
     

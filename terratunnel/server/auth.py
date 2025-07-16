@@ -362,7 +362,12 @@ async def require_admin_user(request: Request, auth_token: Optional[str] = Cooki
     if not user:
         # Redirect to login page
         login_url = str(request.url_for("login_page"))
-        redirect_url = str(request.url)
+        # Build redirect URL with proper scheme
+        is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+        host = request.headers.get("host", "localhost")
+        path = request.url.path
+        query = f"?{request.url.query}" if request.url.query else ""
+        redirect_url = f"{'https' if is_https else 'http'}://{host}{path}{query}"
         return RedirectResponse(url=f"{login_url}?redirect_uri={redirect_url}", status_code=302)
     
     # Check if user is admin
