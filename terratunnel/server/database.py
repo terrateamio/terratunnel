@@ -8,6 +8,10 @@ import secrets
 
 logger = logging.getLogger("terratunnel-server")
 
+import string
+import random
+from coolname import generate_slug
+
 # Supported OAuth providers
 AUTH_PROVIDERS = {
     'github': 'GitHub',
@@ -43,6 +47,17 @@ class Database:
             cursor.execute("ALTER TABLE tunnel_audit_log ADD COLUMN username TEXT")
             conn.commit()
         
+        # Check if users table exists and needs tunnel_subdomain column
+        cursor.execute("PRAGMA table_info(users)")
+        user_columns = cursor.fetchall()
+        user_column_names = [col[1] for col in user_columns]
+        
+        # Add tunnel_subdomain column if it doesn't exist
+        if user_columns and 'tunnel_subdomain' not in user_column_names:
+            logger.info("     Migrating users table: adding tunnel_subdomain column")
+            cursor.execute("ALTER TABLE users ADD COLUMN tunnel_subdomain TEXT UNIQUE")
+            conn.commit()
+        
         # Create users table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -53,6 +68,7 @@ class Database:
                 email TEXT,
                 name TEXT,
                 avatar_url TEXT,
+                tunnel_subdomain TEXT UNIQUE,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 is_active BOOLEAN NOT NULL DEFAULT 1,
@@ -249,14 +265,17 @@ class Database:
                 user_id = existing[0]
                 logger.info(f"     Updated user: {provider_username} [{auth_provider}] (ID: {user_id})")
             else:
-                # Create new user
+                # Create new user with a static subdomain
+                # Generate a unique subdomain for this user
+                tunnel_subdomain = self._generate_unique_subdomain(cursor)
+                
                 cursor.execute("""
                     INSERT INTO users (auth_provider, provider_user_id, provider_username, 
-                                     email, name, avatar_url)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (auth_provider, provider_user_id, provider_username, email, name, avatar_url))
+                                     email, name, avatar_url, tunnel_subdomain)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (auth_provider, provider_user_id, provider_username, email, name, avatar_url, tunnel_subdomain))
                 user_id = cursor.lastrowid
-                logger.info(f"     Created new user: {provider_username} [{auth_provider}] (ID: {user_id})")
+                logger.info(f"     Created new user: {provider_username} [{auth_provider}] (ID: {user_id}) with subdomain: {tunnel_subdomain}")
             
             conn.commit()
             return user_id
@@ -314,7 +333,7 @@ class Database:
     # API key management methods
     def create_api_key(self, user_id: int, name: Optional[str] = None, 
                       expires_at: Optional[datetime] = None, scopes: str = "tunnel:create") -> str:
-        """Create a new API key for a user and return the raw key"""
+        """Create a new API key for a user and return the raw key (replaces any existing key)"""
         # Generate a secure random API key
         raw_key = secrets.token_urlsafe(32)
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
@@ -324,13 +343,21 @@ class Database:
         cursor = conn.cursor()
         
         try:
+            # First, deactivate any existing API keys for this user
+            cursor.execute("""
+                UPDATE api_keys 
+                SET is_active = 0
+                WHERE user_id = ? AND is_active = 1
+            """, (user_id,))
+            
+            # Now create the new API key
             cursor.execute("""
                 INSERT INTO api_keys (user_id, key_hash, key_prefix, name, expires_at, scopes)
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (user_id, key_hash, key_prefix, name, expires_at, scopes))
             
             conn.commit()
-            logger.info(f"     Created API key for user {user_id}: {key_prefix}...")
+            logger.info(f"     Created API key for user {user_id}: {key_prefix}... (replaced existing keys)")
             return raw_key
         except Exception as e:
             logger.error(f"     Failed to create API key: {e}")
@@ -347,9 +374,9 @@ class Database:
         cursor = conn.cursor()
         
         try:
-            # Get API key and user info
+            # Get API key and user info including tunnel_subdomain
             cursor.execute("""
-                SELECT k.*, u.id as user_id, u.provider_username, u.email, u.auth_provider
+                SELECT k.*, u.id as user_id, u.provider_username, u.email, u.auth_provider, u.tunnel_subdomain
                 FROM api_keys k
                 JOIN users u ON k.user_id = u.id
                 WHERE k.key_hash = ? AND k.is_active = 1 AND u.is_active = 1
@@ -408,3 +435,27 @@ class Database:
             return False
         finally:
             conn.close()
+    
+    def _generate_unique_subdomain(self, cursor) -> str:
+        """Generate a unique, human-readable subdomain for a user"""
+        max_attempts = 100
+        
+        for _ in range(max_attempts):
+            # Generate a readable subdomain like "happy-panda-42" or "blue-river-dancing"
+            # Using 3 words for good uniqueness while keeping it memorable
+            subdomain = generate_slug(3)
+            
+            # Check if it's already taken
+            cursor.execute("SELECT id FROM users WHERE tunnel_subdomain = ?", (subdomain,))
+            if not cursor.fetchone():
+                return subdomain
+        
+        # Fallback to random string if we can't find a unique readable name
+        # This is very unlikely with 3-word combinations
+        while True:
+            characters = string.ascii_lowercase + string.digits
+            subdomain = ''.join(random.choices(characters, k=12))
+            cursor.execute("SELECT id FROM users WHERE tunnel_subdomain = ?", (subdomain,))
+            if not cursor.fetchone():
+                logger.warning(f"Had to use random subdomain after {max_attempts} attempts")
+                return subdomain

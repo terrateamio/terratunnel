@@ -9,8 +9,10 @@ import time
 import os
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, Cookie
+from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse, Response, HTMLResponse, RedirectResponse
 import uvicorn
+from coolname import generate_slug
 from .database import Database
 from .config import Config
 from .auth import auth_router, require_admin_user, set_database as set_auth_database
@@ -31,8 +33,22 @@ class ConnectionManager:
         self.lock = threading.Lock()
 
     def generate_subdomain(self) -> str:
+        """Generate a human-readable subdomain for anonymous users"""
+        max_attempts = 50
+        
+        for _ in range(max_attempts):
+            # Generate readable subdomain with 3 words
+            subdomain = generate_slug(3)
+            
+            # Check if it's already in use
+            with self.lock:
+                if subdomain not in self.active_connections:
+                    return subdomain
+        
+        # Fallback to random string if we can't find a unique readable name
+        # This is very unlikely with 3-word combinations
         chars = string.ascii_lowercase + string.digits
-        return ''.join(secrets.choice(chars) for _ in range(8))
+        return ''.join(secrets.choice(chars) for _ in range(12))
 
 
     def disconnect(self, subdomain: str):
@@ -54,7 +70,8 @@ class ConnectionManager:
 
     def get_subdomain_from_hostname(self, hostname: str) -> Optional[str]:
         with self.lock:
-            return self.hostname_to_subdomain.get(hostname)
+            # Normalize hostname to lowercase for case-insensitive lookup
+            return self.hostname_to_subdomain.get(hostname.lower())
     
     def get_endpoint_from_subdomain(self, subdomain: str) -> Optional[str]:
         with self.lock:
@@ -116,6 +133,35 @@ manager = None
 db = None
 auth_middleware = None
 
+@app.middleware("http")
+async def subdomain_proxy_middleware(request: Request, call_next):
+    """Middleware to handle subdomain proxy requests before regular routes"""
+    # Skip if manager not initialized
+    if not manager:
+        return await call_next(request)
+    
+    host_header = request.headers.get("host", "")
+    if not host_header:
+        return await call_next(request)
+    
+    hostname = host_header.split(':')[0].lower()
+    
+    # Check if this is a subdomain request
+    if hostname != manager.domain and hostname.endswith(f".{manager.domain}"):
+        # This is a subdomain request - handle it as a proxy request
+        subdomain = manager.get_subdomain_from_hostname(hostname)
+        if subdomain:
+            # Get the path
+            path = request.url.path
+            if path.startswith("/"):
+                path = path[1:]  # Remove leading slash for consistency
+            
+            # Call the proxy handler directly
+            return await proxy_request(request, path)
+    
+    # Not a subdomain request, continue with normal routes
+    return await call_next(request)
+
 # Include routers immediately to ensure proper route registration order
 # The routers will check for configuration internally
 app.include_router(auth_router)
@@ -152,7 +198,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if auth_result is None:
                 # WebSocket was closed by middleware
                 return
-            user_id, api_key_id = auth_result
+            user_id, api_key_id, tunnel_subdomain = auth_result
             
             if user_id:
                 # Check user tunnel limit
@@ -165,14 +211,28 @@ async def websocket_endpoint(websocket: WebSocket):
                 if user:
                     username = user['provider_username']
                     logger.info(f"     Authenticated tunnel creation for user: {username} (ID: {user_id})")
-        
-        # Generate subdomain and complete connection FIRST
-        subdomain = manager.generate_subdomain()
-        hostname = f"{subdomain}.{manager.domain}"
+                    
+                # Use the user's static subdomain
+                if tunnel_subdomain:
+                    subdomain = tunnel_subdomain
+                    hostname = f"{subdomain}.{manager.domain}"
+                else:
+                    # This shouldn't happen if the database migration worked correctly
+                    logger.error(f"User {user_id} has no tunnel_subdomain assigned")
+                    await websocket.close(code=1008, reason="No tunnel subdomain assigned")
+                    return
+            else:
+                # No authentication - generate random subdomain
+                subdomain = manager.generate_subdomain()
+                hostname = f"{subdomain}.{manager.domain}"
+        else:
+            # No auth middleware - generate random subdomain
+            subdomain = manager.generate_subdomain()
+            hostname = f"{subdomain}.{manager.domain}"
         
         with manager.lock:
             manager.active_connections[subdomain] = websocket
-            manager.hostname_to_subdomain[hostname] = subdomain
+            manager.hostname_to_subdomain[hostname.lower()] = subdomain
             manager.subdomain_to_endpoint[subdomain] = local_endpoint
         
         logger.info(f"     WebSocket client connected: {hostname} -> {local_endpoint}")
@@ -258,10 +318,12 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
     
     if user:
         # User is logged in, show dashboard
-        # Get user's API keys
+        # Get user's API keys and tunnel subdomain
         api_keys = []
+        user_details = None
         if db:
             api_keys = db.list_user_api_keys(user["id"])
+            user_details = db.get_user_by_id(user["id"])
         
         html = f"""
         <!DOCTYPE html>
@@ -367,6 +429,17 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                     font-size: 0.9em;
                     margin-top: 5px;
                 }}
+                .tunnel-url {{
+                    background: #f6f8fa;
+                    border: 1px solid #e1e4e8;
+                    border-radius: 6px;
+                    padding: 15px 20px;
+                    margin: 15px 0;
+                    font-family: monospace;
+                    font-size: 16px;
+                    color: #0066cc;
+                    text-align: center;
+                }}
                 .button {{
                     display: inline-block;
                     padding: 10px 20px;
@@ -426,42 +499,44 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
             
             <div class="container">
                 <div class="card">
-                    <h1>API Keys</h1>
-                    <p>Use API keys to create tunnels programmatically. Include your API key in the Authorization header.</p>
-                    
-                    <a href="/api/keys/new" class="button">Generate New API Key</a>
+                    <h1>Your Tunnel</h1>
+                    <p>Your permanent tunnel URL:</p>
+                    <div class="tunnel-url">
+                        <code>https://{user_details.get('tunnel_subdomain', 'unknown')}.{manager.domain}</code>
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <h1>API Key</h1>
+                    <p>Use your API key to connect the tunnel client. You can have one active API key at a time.</p>
                     
                     <div class="api-keys">
         """
         
+        # Find the active API key (should only be one)
+        active_key = None
         if api_keys:
-            # Filter to only show active keys
             active_keys = [key for key in api_keys if key.get('is_active', 1)]
-            for key in active_keys:
-                created_date = key['created_at'].split('T')[0] if 'T' in key['created_at'] else key['created_at'].split()[0]
-                html += f"""
+            if active_keys:
+                active_key = active_keys[0]
+        
+        if active_key:
+            created_date = active_key['created_at'].split('T')[0] if 'T' in active_key['created_at'] else active_key['created_at'].split()[0]
+            html += f"""
                         <div class="api-key">
                             <div class="api-key-info">
-                                <div class="api-key-prefix">{key['key_prefix']}...</div>
-                                <div class="api-key-name">{key['name'] or 'Unnamed key'}</div>
+                                <div class="api-key-prefix">{active_key['key_prefix']}...</div>
+                                <div class="api-key-name">{active_key['name'] or 'API Key'}</div>
                                 <div class="api-key-created">Created on {created_date}</div>
                             </div>
-                            <button class="button button-danger" 
-                                    onclick="if(confirm('Are you sure you want to revoke this API key?')) {{ fetch('/api/keys/{key['id']}/revoke', {{ method: 'POST', credentials: 'same-origin', redirect: 'follow' }}).then(response => {{ if(response.redirected) {{ window.location.href = response.url; }} else {{ window.location.reload(); }} }}).catch(err => {{ console.error('Revoke failed:', err); alert('Failed to revoke API key'); }}); }} return false;">
-                                Revoke
-                            </button>
+                            <a href="/api/keys/new" class="button">Rotate API Key</a>
                         </div>
-                """
-            if not active_keys:
-                html += """
-                        <div class="empty">
-                            <p>You don't have any API keys yet.</p>
-                        </div>
-                """
+            """
         else:
             html += """
                         <div class="empty">
-                            <p>You don't have any API keys yet.</p>
+                            <p>You don't have an API key yet.</p>
+                            <a href="/api/keys/new" class="button">Generate API Key</a>
                         </div>
             """
         
@@ -599,11 +674,19 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
 @app.get("/api/keys/new", response_class=HTMLResponse)
 async def new_api_key_page(request: Request, auth_token: Optional[str] = Cookie(None)):
     """Page to generate a new API key"""
+    
     from .auth import get_current_user_from_cookie
     
     user = await get_current_user_from_cookie(request, auth_token)
     if not user:
         return RedirectResponse(url="/auth/github?redirect_uri=/api/keys/new", status_code=302)
+    
+    # Check if user already has an API key
+    has_api_key = False
+    if db:
+        api_keys = db.list_user_api_keys(user["id"])
+        active_keys = [key for key in api_keys if key.get('is_active', 1)]
+        has_api_key = len(active_keys) > 0
     
     html = f"""
     <!DOCTYPE html>
@@ -716,6 +799,15 @@ async def new_api_key_page(request: Request, auth_token: Optional[str] = Cookie(
                 gap: 10px;
                 margin-top: 20px;
             }}
+            .warning {{
+                background: #fff3cd;
+                border: 1px solid #ffeaa7;
+                color: #856404;
+                padding: 12px 16px;
+                border-radius: 6px;
+                margin: 20px 0;
+                font-size: 14px;
+            }}
         </style>
     </head>
     <body>
@@ -727,7 +819,7 @@ async def new_api_key_page(request: Request, auth_token: Optional[str] = Cookie(
         
         <div class="container">
             <div class="card">
-                <h1>Generate New API Key</h1>
+                <h1>{("Generate API Key" if not has_api_key else "Rotate API Key")}</h1>
                 <form method="POST" action="/api/keys/generate">
                     <div class="form-group">
                         <label for="name">API Key Name (optional)</label>
@@ -735,8 +827,10 @@ async def new_api_key_page(request: Request, auth_token: Optional[str] = Cookie(
                         <div class="help-text">Give your API key a name to help you remember what it's used for.</div>
                     </div>
                     
+                    {('<div class="warning">⚠️ Generating a new API key will immediately revoke your existing key.</div>' if has_api_key else '')}
+                    
                     <div class="buttons">
-                        <button type="submit" class="button">Generate API Key</button>
+                        <button type="submit" class="button">{("Generate API Key" if not has_api_key else "Rotate API Key")}</button>
                         <a href="/" class="button button-secondary">Cancel</a>
                     </div>
                 </form>
@@ -752,6 +846,7 @@ async def new_api_key_page(request: Request, auth_token: Optional[str] = Cookie(
 @app.post("/api/keys/generate")
 async def generate_api_key(request: Request, auth_token: Optional[str] = Cookie(None)):
     """Generate a new API key for the user"""
+    
     from .auth import get_current_user_from_cookie
     
     user = await get_current_user_from_cookie(request, auth_token)
@@ -927,6 +1022,7 @@ async def generate_api_key(request: Request, auth_token: Optional[str] = Cookie(
 @app.post("/api/keys/{key_id}/revoke")
 async def revoke_api_key(key_id: int, request: Request, auth_token: Optional[str] = Cookie(None)):
     """Revoke an API key"""
+    
     from .auth import get_current_user_from_cookie
     
     user = await get_current_user_from_cookie(request, auth_token)
@@ -1349,16 +1445,14 @@ async def proxy_request(request: Request, path: str):
         raise HTTPException(status_code=400, detail="Host header required")
     
     # Strip port from host header if present (e.g., "example.com:8000" -> "example.com")
-    hostname = host_header.split(':')[0]
+    # Normalize to lowercase for consistent lookup
+    hostname = host_header.split(':')[0].lower()
     
-    # Check if this is the main domain (not a subdomain) - skip proxy handling
-    # Main domain requests should be handled by app routes, not proxied
-    if hostname == manager.domain:
-        # This is the main domain, not a tunnel subdomain
-        raise HTTPException(status_code=404, detail="Not found")
     
     subdomain = manager.get_subdomain_from_hostname(hostname)
     if not subdomain:
+        logger.debug(f"Subdomain lookup failed for hostname: {hostname}")
+        logger.debug(f"Available hostnames: {list(manager.hostname_to_subdomain.keys())}")
         raise HTTPException(status_code=404, detail=f"Tunnel {hostname} not found")
     
     body = await request.body()
