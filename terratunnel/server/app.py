@@ -415,7 +415,9 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         """
         
         if api_keys:
-            for key in api_keys:
+            # Filter to only show active keys
+            active_keys = [key for key in api_keys if key.get('is_active', 1)]
+            for key in active_keys:
                 created_date = key['created_at'].split('T')[0] if 'T' in key['created_at'] else key['created_at'].split()[0]
                 html += f"""
                         <div class="api-key">
@@ -425,9 +427,15 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                                 <div class="api-key-created">Created on {created_date}</div>
                             </div>
                             <button class="button button-danger" 
-                                    onclick="if(confirm('Are you sure you want to revoke this API key?')) {{ fetch('/api/keys/{key['id']}/revoke', {{ method: 'POST', credentials: 'same-origin' }}).then(() => window.location.reload()); }} return false;">
+                                    onclick="if(confirm('Are you sure you want to revoke this API key?')) {{ fetch('/api/keys/{key['id']}/revoke', {{ method: 'POST', credentials: 'same-origin', redirect: 'follow' }}).then(response => {{ if(response.redirected) {{ window.location.href = response.url; }} else {{ window.location.reload(); }} }}).catch(err => {{ console.error('Revoke failed:', err); alert('Failed to revoke API key'); }}); }} return false;">
                                 Revoke
                             </button>
+                        </div>
+                """
+            if not active_keys:
+                html += """
+                        <div class="empty">
+                            <p>You don't have any API keys yet.</p>
                         </div>
                 """
         else:
