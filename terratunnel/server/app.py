@@ -566,6 +566,7 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         <body>
             <div class="container">
                 <div class="logo"><img src="/logo-wordmark.svg" alt="Terratunnel" style="height: 64px; margin-bottom: 20px;"></div>
+                <h1>Welcome to Terratunnel</h1>
                 <p>Secure HTTP tunneling for webhook development and testing.</p>
                 
                 <div class="features">
