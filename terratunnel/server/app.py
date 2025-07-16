@@ -8,7 +8,7 @@ import uuid
 import time
 import os
 from typing import Dict, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, Cookie
 from fastapi.responses import JSONResponse, Response, HTMLResponse, RedirectResponse
 import uvicorn
 from .database import Database
