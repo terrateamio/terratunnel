@@ -6,6 +6,7 @@ import signal
 import sys
 import os
 import time
+import base64
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 from urllib.parse import urlparse
@@ -251,38 +252,66 @@ class TunnelClient:
         response_body = response_data.get("body", "")
         if response_body:
             logger.info("  Response Body:")
-            # Pretty print JSON if possible
-            try:
-                import json
-                if response_headers.get("content-type", "").startswith("application/json"):
-                    parsed = json.loads(response_body)
-                    formatted = json.dumps(parsed, indent=2)
-                    # Limit body size in logs
-                    if len(formatted) > 1000:
-                        lines = formatted.split('\n')
-                        if len(lines) > 20:
-                            truncated = '\n'.join(lines[:20]) + f"\n    ... ({len(lines) - 20} more lines)"
+            
+            # Check if response is binary
+            if response_data.get("is_binary"):
+                logger.info(f"    [Binary data: {len(response_body)} bytes base64-encoded]")
+            else:
+                # Pretty print JSON if possible
+                try:
+                    import json
+                    if response_headers.get("content-type", "").startswith("application/json"):
+                        parsed = json.loads(response_body)
+                        formatted = json.dumps(parsed, indent=2)
+                        # Limit body size in logs
+                        if len(formatted) > 1000:
+                            lines = formatted.split('\n')
+                            if len(lines) > 20:
+                                truncated = '\n'.join(lines[:20]) + f"\n    ... ({len(lines) - 20} more lines)"
+                            else:
+                                truncated = formatted[:1000] + "..."
+                            logger.info(f"    {truncated}")
                         else:
-                            truncated = formatted[:1000] + "..."
-                        logger.info(f"    {truncated}")
+                            for line in formatted.split('\n'):
+                                logger.info(f"    {line}")
                     else:
-                        for line in formatted.split('\n'):
-                            logger.info(f"    {line}")
-                else:
-                    # Non-JSON body
+                        # Non-JSON body
+                        if len(response_body) > 500:
+                            logger.info(f"    {response_body[:500]}...")
+                        else:
+                            logger.info(f"    {response_body}")
+                except:
+                    # Fallback for invalid JSON or other issues
                     if len(response_body) > 500:
                         logger.info(f"    {response_body[:500]}...")
                     else:
                         logger.info(f"    {response_body}")
-            except:
-                # Fallback for invalid JSON or other issues
-                if len(response_body) > 500:
-                    logger.info(f"    {response_body[:500]}...")
-                else:
-                    logger.info(f"    {response_body}")
         
         # Add separator line for readability
         logger.info("  " + "-" * 80)
+
+    def _is_binary_content(self, content_type: str) -> bool:
+        """Determine if content type indicates binary data."""
+        # Common binary content types
+        binary_types = [
+            'image/', 'audio/', 'video/', 'application/pdf',
+            'application/zip', 'application/x-zip', 'application/x-zip-compressed',
+            'application/octet-stream', 'application/x-tar', 'application/x-gzip',
+            'application/x-bzip2', 'application/x-7z-compressed',
+            'application/vnd.ms-excel', 'application/vnd.openxmlformats',
+            'application/msword', 'application/vnd.ms-powerpoint',
+            'application/x-rar-compressed', 'application/java-archive',
+            'application/x-shockwave-flash', 'application/x-msdownload',
+            'application/x-deb', 'application/x-rpm'
+        ]
+        
+        for binary_type in binary_types:
+            if content_type.startswith(binary_type):
+                return True
+        
+        # Also check for common binary file extensions in content-disposition
+        # This helps when content-type is generic like 'application/octet-stream'
+        return False
 
     async def handle_request(self, request_data: dict) -> dict:
         try:
@@ -291,6 +320,10 @@ class TunnelClient:
             headers = request_data.get("headers", {})
             query_params = request_data.get("query_params", {})
             body = request_data.get("body", "")
+            
+            # Handle binary request body if present
+            if request_data.get("is_binary") and body:
+                body = base64.b64decode(body)
             
             url = f"{self.local_url}{path}"
             
@@ -304,11 +337,22 @@ class TunnelClient:
                     timeout=30.0  # 30 second timeout
                 )
                 
+                # Check if response is binary based on content-type
+                content_type = response.headers.get("content-type", "").lower()
+                is_binary = self._is_binary_content(content_type)
+                
                 response_data = {
                     "status_code": response.status_code,
                     "headers": dict(response.headers),
-                    "body": response.text
                 }
+                
+                if is_binary:
+                    # Encode binary data as base64
+                    response_data["body"] = base64.b64encode(response.content).decode('ascii')
+                    response_data["is_binary"] = True
+                else:
+                    response_data["body"] = response.text
+                    response_data["is_binary"] = False
                 
                 # Log request details for user visibility
                 self._log_request(request_data, response_data)
@@ -323,7 +367,8 @@ class TunnelClient:
             error_response = {
                 "status_code": 500,
                 "headers": {},
-                "body": f"Internal server error: {str(e)}"
+                "body": f"Internal server error: {str(e)}",
+                "is_binary": False
             }
             
             # Log error request

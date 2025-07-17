@@ -7,6 +7,7 @@ import json
 import uuid
 import time
 import os
+import base64
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, Cookie
 from fastapi.routing import APIRoute
@@ -277,7 +278,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Use the user's static subdomain
                 if tunnel_subdomain:
                     subdomain = tunnel_subdomain
-                    hostname = f"{subdomain}.{manager.domain}"
+                    # Strip port from domain for hostname lookup
+                    domain_without_port = manager.domain.split(':')[0]
+                    hostname = f"{subdomain}.{domain_without_port}"
                 else:
                     # This shouldn't happen if the database migration worked correctly
                     logger.error(f"User {user_id} has no tunnel_subdomain assigned")
@@ -286,11 +289,15 @@ async def websocket_endpoint(websocket: WebSocket):
             else:
                 # No authentication - generate random subdomain
                 subdomain = manager.generate_subdomain()
-                hostname = f"{subdomain}.{manager.domain}"
+                # Strip port from domain for hostname lookup
+                domain_without_port = manager.domain.split(':')[0]
+                hostname = f"{subdomain}.{domain_without_port}"
         else:
             # No auth middleware - generate random subdomain
             subdomain = manager.generate_subdomain()
-            hostname = f"{subdomain}.{manager.domain}"
+            # Strip port from domain for hostname lookup
+            domain_without_port = manager.domain.split(':')[0]
+            hostname = f"{subdomain}.{domain_without_port}"
         
         with manager.lock:
             manager.active_connections[subdomain] = websocket
@@ -317,9 +324,11 @@ async def websocket_endpoint(websocket: WebSocket):
             )
         
         # Send hostname assignment immediately
+        # Send full hostname with port to client for display
+        hostname_with_port = f"{subdomain}.{manager.domain}"
         await websocket.send_text(json.dumps({
             "type": "hostname_assigned",
-            "hostname": hostname,
+            "hostname": hostname_with_port,
             "subdomain": subdomain
         }))
         
@@ -1495,6 +1504,28 @@ async def admin_api_audit(request: Request, current_user = Depends(require_admin
     }
 
 
+def _is_binary_content(content_type: str) -> bool:
+    """Determine if content type indicates binary data."""
+    # Common binary content types
+    binary_types = [
+        'image/', 'audio/', 'video/', 'application/pdf',
+        'application/zip', 'application/x-zip', 'application/x-zip-compressed',
+        'application/octet-stream', 'application/x-tar', 'application/x-gzip',
+        'application/x-bzip2', 'application/x-7z-compressed',
+        'application/vnd.ms-excel', 'application/vnd.openxmlformats',
+        'application/msword', 'application/vnd.ms-powerpoint',
+        'application/x-rar-compressed', 'application/java-archive',
+        'application/x-shockwave-flash', 'application/x-msdownload',
+        'application/x-deb', 'application/x-rpm'
+    ]
+    
+    for binary_type in binary_types:
+        if content_type.startswith(binary_type):
+            return True
+    
+    return False
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy_request(request: Request, path: str):
     # Skip if manager not initialized (during startup)
@@ -1502,6 +1533,7 @@ async def proxy_request(request: Request, path: str):
         raise HTTPException(status_code=503, detail="Service starting up")
     
     host_header = request.headers.get("host", "")
+    logger.debug(f"Proxy request - Host: {host_header}, Path: {path}")
     
     if not host_header:
         raise HTTPException(status_code=400, detail="Host header required")
@@ -1519,13 +1551,33 @@ async def proxy_request(request: Request, path: str):
     
     body = await request.body()
     
+    # Check if request contains binary data
+    content_type = request.headers.get("content-type", "").lower()
+    is_binary_request = _is_binary_content(content_type)
+    
     request_data = {
         "method": request.method,
         "path": f"/{path}" if path else "/",
         "headers": dict(request.headers),
         "query_params": dict(request.query_params),
-        "body": body.decode() if body else ""
     }
+    
+    if body:
+        if is_binary_request:
+            # Encode binary data as base64
+            request_data["body"] = base64.b64encode(body).decode('ascii')
+            request_data["is_binary"] = True
+        else:
+            try:
+                request_data["body"] = body.decode('utf-8')
+                request_data["is_binary"] = False
+            except UnicodeDecodeError:
+                # Fallback to base64 if decode fails
+                request_data["body"] = base64.b64encode(body).decode('ascii')
+                request_data["is_binary"] = True
+    else:
+        request_data["body"] = ""
+        request_data["is_binary"] = False
     
     response_data = await manager.send_request(subdomain, request_data)
     
@@ -1543,8 +1595,16 @@ async def proxy_request(request: Request, path: str):
         if key.lower() not in skip_headers:
             filtered_headers[key] = value
     
+    # Handle binary response data
+    response_body = response_data.get("body", "")
+    if response_data.get("is_binary") and response_body:
+        # Decode base64 back to binary
+        content = base64.b64decode(response_body)
+    else:
+        content = response_body
+    
     return Response(
-        content=response_data.get("body", ""),
+        content=content,
         status_code=response_data.get("status_code", 200),
         headers=filtered_headers
     )
