@@ -199,8 +199,17 @@ async def require_admin_api(api_key_info: dict = Depends(get_current_user_from_a
     return api_key_info
 
 
+async def require_admin_cookie(request: Request, user: dict = Depends(get_current_user_from_cookie)) -> dict:
+    """Dependency to require admin user via cookie/JWT"""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not Config.is_admin_user(user["provider"], user["username"]):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
 @api_router.get("/admin/db/tables")
-async def list_database_tables(admin: dict = Depends(require_admin_api)):
+async def list_database_tables(request: Request, admin: dict = Depends(require_admin_cookie)):
     """List all tables in the database"""
     db = get_database()
     conn = sqlite3.connect(db.db_path)
@@ -241,7 +250,8 @@ async def get_table_data(
     table_name: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=1000),
-    admin: dict = Depends(require_admin_api)
+    request: Request = None,
+    admin: dict = Depends(require_admin_cookie)
 ):
     """Get paginated data from a specific table"""
     db = get_database()
@@ -292,7 +302,8 @@ async def get_table_data(
 @api_router.get("/admin/db/query")
 async def execute_query(
     query: str = Query(..., description="SQL query to execute"),
-    admin: dict = Depends(require_admin_api)
+    request: Request = None,
+    admin: dict = Depends(require_admin_cookie)
 ):
     """Execute a custom SQL query (SELECT only for safety)"""
     # Only allow SELECT queries for safety
@@ -331,7 +342,7 @@ async def execute_query(
 
 
 @api_router.get("/admin/db/download")
-async def download_database(admin: dict = Depends(require_admin_api)):
+async def download_database(request: Request, admin: dict = Depends(require_admin_cookie)):
     """Download the entire database file"""
     db = get_database()
     
@@ -352,45 +363,5 @@ async def download_database(admin: dict = Depends(require_admin_api)):
         raise HTTPException(status_code=500, detail=f"Failed to read database: {str(e)}")
 
 
-# JWT-based admin endpoints (for web UI)
-async def require_admin_jwt(request: Request) -> dict:
-    """Dependency to require admin user via JWT cookie"""
-    user = await get_current_user_from_cookie(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    if not Config.is_admin_user(user["provider"], user["username"]):
-        raise HTTPException(status_code=403, detail="Admin access required")
-    return user
-
-
-@api_router.get("/admin/db/tables", dependencies=[Depends(require_admin_jwt)])
-async def list_database_tables_jwt(request: Request):
-    """List all tables in the database (JWT auth)"""
-    return await list_database_tables(admin=await require_admin_jwt(request))
-
-
-@api_router.get("/admin/db/tables/{table_name}", dependencies=[Depends(require_admin_jwt)])
-async def get_table_data_jwt(
-    table_name: str,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=1000),
-    request: Request = None
-):
-    """Get paginated data from a specific table (JWT auth)"""
-    return await get_table_data(table_name, page, page_size, admin=await require_admin_jwt(request))
-
-
-@api_router.get("/admin/db/query", dependencies=[Depends(require_admin_jwt)])
-async def execute_query_jwt(
-    query: str = Query(..., description="SQL query to execute"),
-    request: Request = None
-):
-    """Execute a custom SQL query (JWT auth)"""
-    return await execute_query(query, admin=await require_admin_jwt(request))
-
-
-@api_router.get("/admin/db/download", dependencies=[Depends(require_admin_jwt)])
-async def download_database_jwt(request: Request):
-    """Download the entire database file (JWT auth)"""
-    return await download_database(admin=await require_admin_jwt(request))
+# Removed duplicate JWT-based admin endpoints - using cookie auth in the main endpoints above
 

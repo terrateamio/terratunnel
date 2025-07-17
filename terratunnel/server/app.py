@@ -16,7 +16,7 @@ import uvicorn
 from coolname import generate_slug
 from .database import Database
 from .config import Config
-from .auth import auth_router, require_admin_user, set_database as set_auth_database
+from .auth import auth_router, require_admin_user, get_current_user_from_cookie, set_database as set_auth_database
 from .api import api_router, set_database as set_api_database
 from .middleware import AuthMiddleware
 from ..utils import is_binary_content
@@ -802,21 +802,9 @@ def is_admin_user(user: dict) -> bool:
     return Config.is_admin_user(user.get("provider"), user.get("username"))
 
 
-@app.get("/admin/database", response_class=HTMLResponse)
-async def admin_database_browser(request: Request, auth_token: Optional[str] = Cookie(None)):
+@app.get("/admin/database", response_class=HTMLResponse, dependencies=[Depends(require_admin_user)])
+async def admin_database_browser(request: Request, user: dict = Depends(get_current_user_from_cookie)):
     """Admin database browser interface"""
-    # Verify auth
-    user = None
-    if auth_token:
-        try:
-            from .auth import verify_jwt_token
-            user = verify_jwt_token(auth_token)
-        except:
-            pass
-    
-    # Check admin access
-    if not user or not is_admin_user(user):
-        return RedirectResponse(url="/auth/login", status_code=303)
     
     html = f"""
     <!DOCTYPE html>
