@@ -58,6 +58,16 @@ class Database:
             cursor.execute("ALTER TABLE users ADD COLUMN tunnel_subdomain TEXT UNIQUE")
             conn.commit()
         
+        # Check if api_keys table exists and needs tunnel_id column
+        cursor.execute("PRAGMA table_info(api_keys)")
+        api_key_columns = cursor.fetchall()
+        api_key_column_names = [col[1] for col in api_key_columns]
+        
+        if api_key_columns and 'tunnel_id' not in api_key_column_names:
+            logger.info("     Migrating api_keys table: adding tunnel_id column")
+            cursor.execute("ALTER TABLE api_keys ADD COLUMN tunnel_id INTEGER REFERENCES tunnels(id)")
+            conn.commit()
+        
         # Create users table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -90,6 +100,19 @@ class Database:
                 expires_at DATETIME,
                 is_active BOOLEAN NOT NULL DEFAULT 1,
                 scopes TEXT DEFAULT 'tunnel:create',
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Create tunnels table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tunnels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                subdomain TEXT UNIQUE NOT NULL,
+                name TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN NOT NULL DEFAULT 1,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
         """)
@@ -150,6 +173,41 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_tunnel_audit_log_user_id 
             ON tunnel_audit_log(user_id)
         """)
+        
+        # Migrate existing tunnel_subdomain data to tunnels table
+        cursor.execute("""
+            SELECT COUNT(*) FROM tunnels
+        """)
+        tunnel_count = cursor.fetchone()[0]
+        
+        if tunnel_count == 0:
+            # Check if we have users with tunnel_subdomain to migrate
+            cursor.execute("""
+                SELECT id, tunnel_subdomain, provider_username 
+                FROM users 
+                WHERE tunnel_subdomain IS NOT NULL
+            """)
+            users_to_migrate = cursor.fetchall()
+            
+            if users_to_migrate:
+                logger.info(f"     Migrating {len(users_to_migrate)} existing user tunnels to tunnels table")
+                for user_id, subdomain, username in users_to_migrate:
+                    # Create tunnel for this user
+                    cursor.execute("""
+                        INSERT INTO tunnels (user_id, subdomain, name)
+                        VALUES (?, ?, ?)
+                    """, (user_id, subdomain, f"Default tunnel"))
+                    
+                    tunnel_id = cursor.lastrowid
+                    
+                    # Update all API keys for this user to point to this tunnel
+                    cursor.execute("""
+                        UPDATE api_keys 
+                        SET tunnel_id = ?
+                        WHERE user_id = ? AND tunnel_id IS NULL
+                    """, (tunnel_id, user_id))
+                    
+                    logger.info(f"     Migrated tunnel for user {username}: {subdomain}")
         
         conn.commit()
         conn.close()
@@ -330,48 +388,139 @@ class Database:
         finally:
             conn.close()
     
-    # API key management methods
-    def create_api_key(self, user_id: int, name: Optional[str] = None, 
-                      expires_at: Optional[datetime] = None, scopes: str = "tunnel:create", is_admin: bool = False) -> str:
-        """Create a new API key for a user and return the raw key
-        
-        For regular users: replaces any existing key
-        For admin users: allows multiple active keys
-        """
-        # Generate a secure random API key
-        raw_key = secrets.token_urlsafe(32)
-        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-        key_prefix = raw_key[:8]  # Store prefix for identification
-        
+    # Tunnel management methods
+    def create_tunnel(self, user_id: int, name: Optional[str] = None) -> Dict:
+        """Create a new tunnel for a user"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         try:
-            # Only deactivate existing keys for non-admin users
-            if not is_admin:
-                cursor.execute("""
-                    UPDATE api_keys 
-                    SET is_active = 0
-                    WHERE user_id = ? AND is_active = 1
-                """, (user_id,))
+            # Generate unique subdomain
+            subdomain = self._generate_unique_subdomain(cursor)
+            
+            cursor.execute("""
+                INSERT INTO tunnels (user_id, subdomain, name)
+                VALUES (?, ?, ?)
+            """, (user_id, subdomain, name or f"Tunnel {subdomain}"))
+            
+            tunnel_id = cursor.lastrowid
+            conn.commit()
+            
+            logger.info(f"     Created tunnel {tunnel_id} for user {user_id}: {subdomain}")
+            
+            return {
+                "id": tunnel_id,
+                "subdomain": subdomain,
+                "name": name or f"Tunnel {subdomain}"
+            }
+        except Exception as e:
+            logger.error(f"     Failed to create tunnel: {e}")
+            raise
+        finally:
+            conn.close()
+    
+    def list_user_tunnels(self, user_id: int) -> List[Dict]:
+        """List all tunnels for a user"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT t.*, 
+                       (SELECT COUNT(*) FROM api_keys WHERE tunnel_id = t.id AND is_active = 1) as active_keys
+                FROM tunnels t
+                WHERE t.user_id = ? AND t.is_active = 1
+                ORDER BY t.created_at DESC
+            """, (user_id,))
+            
+            tunnels = []
+            for row in cursor.fetchall():
+                tunnels.append(dict(row))
+            
+            return tunnels
+        finally:
+            conn.close()
+    
+    def get_tunnel_by_subdomain(self, subdomain: str) -> Optional[Dict]:
+        """Get tunnel info by subdomain"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT t.*, u.provider_username, u.auth_provider
+                FROM tunnels t
+                JOIN users u ON t.user_id = u.id
+                WHERE t.subdomain = ? AND t.is_active = 1
+            """, (subdomain,))
+            
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+    
+    # API key management methods
+    def create_api_key_for_tunnel(self, tunnel_id: int, name: Optional[str] = None, 
+                      expires_at: Optional[datetime] = None, scopes: str = "tunnel:create") -> str:
+        """Create a new API key for a tunnel and return the raw key
+        
+        Each tunnel can only have one active API key at a time.
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            # Get tunnel info to find user_id
+            cursor.execute("SELECT user_id FROM tunnels WHERE id = ?", (tunnel_id,))
+            result = cursor.fetchone()
+            if not result:
+                raise ValueError(f"Tunnel {tunnel_id} not found")
+            user_id = result[0]
+            
+            # Generate a secure random API key
+            raw_key = secrets.token_urlsafe(32)
+            key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+            key_prefix = raw_key[:8]  # Store prefix for identification
+            
+            # Deactivate any existing keys for this tunnel
+            cursor.execute("""
+                UPDATE api_keys 
+                SET is_active = 0
+                WHERE tunnel_id = ? AND is_active = 1
+            """, (tunnel_id,))
             
             # Now create the new API key
             cursor.execute("""
-                INSERT INTO api_keys (user_id, key_hash, key_prefix, name, expires_at, scopes)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (user_id, key_hash, key_prefix, name, expires_at, scopes))
+                INSERT INTO api_keys (user_id, tunnel_id, key_hash, key_prefix, name, expires_at, scopes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (user_id, tunnel_id, key_hash, key_prefix, name, expires_at, scopes))
             
             conn.commit()
-            if is_admin:
-                logger.info(f"     Created API key for admin user {user_id}: {key_prefix}... (keeping existing keys active)")
-            else:
-                logger.info(f"     Created API key for user {user_id}: {key_prefix}... (replaced existing keys)")
+            logger.info(f"     Created API key for tunnel {tunnel_id}: {key_prefix}...")
             return raw_key
         except Exception as e:
             logger.error(f"     Failed to create API key: {e}")
             raise
         finally:
             conn.close()
+    
+    def create_api_key(self, user_id: int, name: Optional[str] = None, 
+                      expires_at: Optional[datetime] = None, scopes: str = "tunnel:create", is_admin: bool = False) -> str:
+        """Legacy method - creates API key for user's default tunnel"""
+        # Get user's tunnels
+        tunnels = self.list_user_tunnels(user_id)
+        
+        if not tunnels:
+            # No tunnel exists, create one
+            tunnel = self.create_tunnel(user_id, "Default tunnel")
+            tunnel_id = tunnel["id"]
+        else:
+            # Use the first (default) tunnel
+            tunnel_id = tunnels[0]["id"]
+        
+        return self.create_api_key_for_tunnel(tunnel_id, name, expires_at, scopes)
     
     def validate_api_key(self, raw_key: str) -> Optional[Dict]:
         """Validate an API key and return user info if valid"""
@@ -382,11 +531,14 @@ class Database:
         cursor = conn.cursor()
         
         try:
-            # Get API key and user info including tunnel_subdomain
+            # Get API key and user/tunnel info
             cursor.execute("""
-                SELECT k.*, u.id as user_id, u.provider_username, u.email, u.auth_provider, u.tunnel_subdomain
+                SELECT k.*, 
+                       u.id as user_id, u.provider_username, u.email, u.auth_provider,
+                       t.id as tunnel_id, t.subdomain as tunnel_subdomain, t.name as tunnel_name
                 FROM api_keys k
                 JOIN users u ON k.user_id = u.id
+                LEFT JOIN tunnels t ON k.tunnel_id = t.id
                 WHERE k.key_hash = ? AND k.is_active = 1 AND u.is_active = 1
                 AND (k.expires_at IS NULL OR k.expires_at > CURRENT_TIMESTAMP)
             """, (key_hash,))

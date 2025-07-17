@@ -179,47 +179,75 @@ The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
 - **JWT Sessions**: Secure session management with configurable expiration
 - **API Key Authentication**: Bearer token authentication for programmatic access
 - **Admin Access Control**: Restricted to users in TERRATUNNEL_{PROVIDER}_ADMIN_USERS
-- **Static Subdomain Assignment**: Predictable URLs per user for security auditing
-- **One Key Per User**: Prevents key proliferation and simplifies management
+- **Static Subdomain Assignment**: Each tunnel gets a predictable URL for security auditing
+- **Tunnel-Based Access**: Each tunnel has its own API key that can be rotated
+- **User Limits**: Non-admin users limited to 1 tunnel, admin users can create multiple
 - **Audit Logging**: All tunnel connections logged with timestamps and user info
 
 ### Database Schema
 
 ```sql
--- Users table with static tunnel subdomain
+-- Users table
 CREATE TABLE users (
     id INTEGER PRIMARY KEY,
-    username TEXT NOT NULL,
-    provider TEXT NOT NULL,
+    auth_provider TEXT NOT NULL,
+    provider_user_id TEXT NOT NULL,
+    provider_username TEXT NOT NULL,
+    email TEXT,
+    name TEXT,
+    avatar_url TEXT,
+    tunnel_subdomain TEXT UNIQUE,  -- Legacy, migrated to tunnels table
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    tunnel_subdomain TEXT UNIQUE,
-    UNIQUE(username, provider)
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT 1,
+    UNIQUE(auth_provider, provider_user_id),
+    UNIQUE(auth_provider, provider_username)
 );
 
--- API keys (one active per user)
+-- Tunnels table (each tunnel has a subdomain and can have one API key)
+CREATE TABLE tunnels (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    subdomain TEXT UNIQUE NOT NULL,
+    name TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT 1,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- API keys (belong to tunnels, not directly to users)
 CREATE TABLE api_keys (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL,
-    api_key_hash TEXT NOT NULL UNIQUE,
-    api_key_prefix TEXT NOT NULL,
+    tunnel_id INTEGER REFERENCES tunnels(id),
+    key_hash TEXT NOT NULL UNIQUE,
+    key_prefix TEXT NOT NULL,
     name TEXT,
     is_active BOOLEAN DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_used_at TIMESTAMP,
     expires_at TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    scopes TEXT DEFAULT 'tunnel:create',
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 -- Audit log for connections
 CREATE TABLE tunnel_audit_log (
     id INTEGER PRIMARY KEY,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    subdomain TEXT NOT NULL,
+    hostname TEXT NOT NULL,
+    local_endpoint TEXT NOT NULL,
+    client_ip TEXT,
+    user_agent TEXT,
+    connection_id TEXT NOT NULL,
+    event_type TEXT DEFAULT 'connect',
     user_id INTEGER,
     username TEXT,
-    subdomain TEXT NOT NULL,
-    connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    disconnected_at TIMESTAMP,
-    client_ip TEXT,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    api_key_id INTEGER,
+    additional_data TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+    FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE SET NULL
 );
 ```
 
@@ -337,7 +365,7 @@ Terratunnel automatically handles large file transfers using a chunked streaming
 
 1. **Static Tunnel URLs**: Each user now gets a permanent subdomain (e.g., `gentle-tiger-swimming.yourdomain.com`) that doesn't change when API keys are rotated.
 
-2. **One API Key Per User**: Users are limited to one active API key at a time. Generating a new key automatically deactivates the old one.
+2. **Tunnel-Based API Keys**: Each tunnel has its own API key that can be rotated independently.
 
 3. **Human-Readable Subdomains**: Using the `coolname` library to generate memorable subdomains instead of random strings.
 
@@ -363,14 +391,21 @@ Terratunnel automatically handles large file transfers using a chunked streaming
 8. **Admin Features Update**:
    - Removed separate admin dashboard at /_admin  
    - Integrated admin features into main dashboard at /
-   - Admin users can create multiple API keys (regular users limited to one)
-   - Each API key can be used to create a separate tunnel
    - Admin dashboard shows all active tunnels and recent connections
-   - Example: Admin users can run multiple tunnels by using different API keys:
-     ```bash
-     # Terminal 1
-     python -m terratunnel client --api-key KEY1 --local-endpoint http://localhost:3000
-     
-     # Terminal 2  
-     python -m terratunnel client --api-key KEY2 --local-endpoint http://localhost:4000
-     ```
+
+9. **Tunnel-Based Architecture** (December 2024):
+   - Introduced proper `tunnels` table in database
+   - Each tunnel consists of:
+     - Unique subdomain (e.g., `happy-panda-123`)
+     - API key (can be rotated without changing subdomain)
+   - Non-admin users: Limited to 1 tunnel
+   - Admin users: Can create multiple tunnels
+   - API keys now belong to tunnels (not directly to users)
+   - UI changes:
+     - Dashboard shows all user's tunnels
+     - Each tunnel has "Generate/Rotate API Key" button
+     - Admin users see "Create New Tunnel" button
+   - Routes added:
+     - `/tunnels/new` - Create new tunnel (admin only)
+     - `/tunnels/{tunnel_id}/keys/new` - Generate/rotate API key for tunnel
+   - Database migration automatically moves existing data to new structure

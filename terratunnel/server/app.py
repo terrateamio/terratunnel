@@ -816,12 +816,14 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
     
     if user:
         # User is logged in, show dashboard
-        # Get user's API keys and tunnel subdomain
+        # Get user's tunnels and API keys
+        tunnels = []
         api_keys = []
         user_details = None
         is_admin = is_admin_user(user)
         
         if db:
+            tunnels = db.list_user_tunnels(user["id"])
             api_keys = db.list_user_api_keys(user["id"])
             user_details = db.get_user_by_id(user["id"])
         
@@ -999,97 +1001,64 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
             
             <div class="container">
                 <div class="card">
-                    <h1>Your Tunnel</h1>
-                    <p>Your permanent tunnel URL:</p>
-                    <div class="tunnel-url">
-                        <code>https://{user_details.get('tunnel_subdomain', 'unknown')}.{manager.domain}</code>
-                    </div>
-                </div>
-                
-                <div class="card">
-                    <h1>API Keys</h1>
-                    <p>Use your API key to connect the tunnel client. """ + ("As an admin, you can have multiple active API keys." if is_admin else "You can have one active API key at a time.") + """</p>
+                    <h1>Your Tunnels</h1>
+                    <p>{"Manage your tunnels and their API keys." if is_admin else "Your tunnel and API key."}</p>
                     
-                    <div class="api-keys">
         """
         
-        # Find active API keys
-        if api_keys:
-            active_keys = [key for key in api_keys if key.get('is_active', 1)]
-            
-            if is_admin and active_keys:
-                # Show all active keys for admin users
-                for key in active_keys:
-                    created_date = key['created_at'].split('T')[0] if 'T' in key['created_at'] else key['created_at'].split()[0]
-                    html += f"""
-                        <div class="api-key">
-                            <div class="api-key-info">
-                                <div class="api-key-prefix">{key['key_prefix']}...</div>
-                                <div class="api-key-name">{key['name'] or 'API Key'}</div>
-                                <div class="api-key-created">Created on {created_date}</div>
-                            </div>
-                        </div>
-                    """
+        # Display tunnels
+        if tunnels:
+            for tunnel in tunnels:
+                # Get active API key count for this tunnel
+                active_key_count = tunnel.get('active_keys', 0)
+                tunnel_url = f"https://{tunnel['subdomain']}.{manager.domain}"
+                
                 html += f"""
-                    <div style="margin-top: 20px;">
-                        <a href="/api/keys/new" class="button">Generate New API Key</a>
+                    <div style="border: 1px solid #e1e4e8; border-radius: 6px; padding: 20px; margin-bottom: 20px;">
+                        <h3 style="margin-top: 0;">{tunnel['name']}</h3>
+                        <div class="tunnel-url">
+                            <code>{tunnel_url}</code>
+                        </div>
+                        <p style="color: #666; margin: 10px 0;">
+                            Subdomain: <code>{tunnel['subdomain']}</code> | 
+                            API Keys: {active_key_count} active
+                        </p>
+                        <div style="margin-top: 15px;">
+                            <a href="/tunnels/{tunnel['id']}/keys/new" class="button" style="margin-right: 10px;">
+                                {"Rotate" if active_key_count > 0 else "Generate"} API Key
+                            </a>
+                        </div>
                     </div>
-                """
-            elif active_keys:
-                # Show single key for regular users
-                active_key = active_keys[0]
-                created_date = active_key['created_at'].split('T')[0] if 'T' in active_key['created_at'] else active_key['created_at'].split()[0]
-                html += f"""
-                        <div class="api-key">
-                            <div class="api-key-info">
-                                <div class="api-key-prefix">{active_key['key_prefix']}...</div>
-                                <div class="api-key-name">{active_key['name'] or 'API Key'}</div>
-                                <div class="api-key-created">Created on {created_date}</div>
-                            </div>
-                            <a href="/api/keys/new" class="button">Rotate API Key</a>
-                        </div>
-                """
-            else:
-                html += """
-                        <div class="empty">
-                            <p>You don't have an API key yet.</p>
-                            <a href="/api/keys/new" class="button">Generate API Key</a>
-                        </div>
                 """
         else:
             html += """
-                        <div class="empty">
-                            <p>You don't have an API key yet.</p>
-                            <a href="/api/keys/new" class="button">Generate API Key</a>
-                        </div>
+                    <div class="empty">
+                        <p>You don't have any tunnels yet.</p>
+                    </div>
             """
         
-        html += """
+        # Add create tunnel button for admin users
+        if is_admin:
+            html += """
+                    <div style="margin-top: 20px; text-align: center;">
+                        <a href="/tunnels/new" class="button">Create New Tunnel</a>
                     </div>
+            """
+            
+        html += """
                 </div>
         """
         
-        # Add multiple API keys section for admin users
-        if is_admin:
-            html += """
+        # Add usage instructions section
+        html += """
                 <div class="card">
-                    <h1>🚀 Multiple Tunnels (Admin Feature)</h1>
-                    <p>As an administrator, you can create multiple API keys to run multiple tunnels simultaneously.</p>
+                    <h1>📖 How to Use Your Tunnel</h1>
+                    <p>Connect to your tunnel using the terratunnel client:</p>
+                    <div class="code-block">python -m terratunnel client \\
+    --api-key YOUR_API_KEY \\
+    --local-endpoint http://localhost:3000</div>
                     
-                    <h3>Create Additional Tunnels</h3>
-                    <p>Unlike regular users, admin users can have multiple active API keys. Each API key can be used to create a separate tunnel:</p>
-                    <div class="code-block"># Generate a new API key from the dashboard above
-# Then use it to create a new tunnel:
-python -m terratunnel client \\
-    --api-key YOUR_NEW_API_KEY \\
-    --local-endpoint http://localhost:3000
-
-# Run another tunnel with a different API key:
-python -m terratunnel client \\
-    --api-key ANOTHER_API_KEY \\
-    --local-endpoint http://localhost:4000</div>
-                    
-                    <p style="margin-top: 20px;"><strong>Note:</strong> Each API key will create a tunnel with its own unique subdomain.</p>
+                    <p style="margin-top: 20px;">Each tunnel has its own subdomain and API key. """ + ("As an admin, you can create multiple tunnels to run simultaneously." if is_admin else "Your tunnel URL remains constant even when you rotate the API key.") + """</p>
                 </div>
         """
         
@@ -1359,6 +1328,211 @@ python -m terratunnel client \\
         """
     
     return HTMLResponse(content=html)
+
+
+@app.get("/tunnels/new", response_class=HTMLResponse)
+async def new_tunnel_page(request: Request, auth_token: Optional[str] = Cookie(None)):
+    """Page to create a new tunnel (admin only)"""
+    
+    from .auth import get_current_user_from_cookie
+    
+    user = await get_current_user_from_cookie(request, auth_token)
+    if not user:
+        return RedirectResponse(url="/auth/github?redirect_uri=/tunnels/new", status_code=302)
+    
+    # Check if user is admin
+    user_details = db.get_user_by_id(user["id"]) if db else None
+    if not user_details or not is_admin_user(user_details):
+        return HTMLResponse("""
+        <h1>Access Denied</h1>
+        <p>Only administrators can create new tunnels.</p>
+        <a href="/">Go back</a>
+        """, status_code=403)
+    
+    # Check tunnel limit for non-admin users (though this shouldn't happen)
+    tunnels = db.list_user_tunnels(user["id"]) if db else []
+    if not is_admin_user(user_details) and len(tunnels) >= 1:
+        return HTMLResponse("""
+        <h1>Tunnel Limit Reached</h1>
+        <p>You already have a tunnel. Non-admin users are limited to one tunnel.</p>
+        <a href="/">Go back</a>
+        """, status_code=403)
+    
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Create New Tunnel - Terratunnel</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 40px; }
+            .container { max-width: 600px; margin: 0 auto; }
+            input[type="text"] { width: 100%; padding: 10px; margin: 10px 0; }
+            button { padding: 10px 20px; background: #0066cc; color: white; border: none; cursor: pointer; }
+            button:hover { background: #0052a3; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Create New Tunnel</h1>
+            <form action="/tunnels/create" method="post">
+                <label for="name">Tunnel Name (optional):</label>
+                <input type="text" id="name" name="name" placeholder="e.g., Development API">
+                <button type="submit">Create Tunnel</button>
+                <a href="/" style="margin-left: 10px;">Cancel</a>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html)
+
+
+@app.post("/tunnels/create")
+async def create_tunnel(request: Request, auth_token: Optional[str] = Cookie(None)):
+    """Create a new tunnel"""
+    
+    from .auth import get_current_user_from_cookie
+    
+    user = await get_current_user_from_cookie(request, auth_token)
+    if not user:
+        return RedirectResponse(url="/auth/github", status_code=302)
+    
+    # Check if user is admin
+    user_details = db.get_user_by_id(user["id"]) if db else None
+    if not user_details or not is_admin_user(user_details):
+        raise HTTPException(status_code=403, detail="Only administrators can create new tunnels")
+    
+    # Get form data
+    form_data = await request.form()
+    tunnel_name = form_data.get("name", "").strip() or None
+    
+    # Create tunnel
+    if db:
+        tunnel = db.create_tunnel(user["id"], tunnel_name)
+        return RedirectResponse(url=f"/?tunnel_created={tunnel['subdomain']}", status_code=302)
+    
+    raise HTTPException(status_code=500, detail="Failed to create tunnel")
+
+
+@app.get("/tunnels/{tunnel_id}/keys/new", response_class=HTMLResponse)
+async def new_tunnel_api_key_page(tunnel_id: int, request: Request, auth_token: Optional[str] = Cookie(None)):
+    """Page to generate a new API key for a tunnel"""
+    
+    from .auth import get_current_user_from_cookie
+    
+    user = await get_current_user_from_cookie(request, auth_token)
+    if not user:
+        return RedirectResponse(url=f"/auth/github?redirect_uri=/tunnels/{tunnel_id}/keys/new", status_code=302)
+    
+    # Verify user owns this tunnel
+    if db:
+        tunnels = db.list_user_tunnels(user["id"])
+        tunnel = next((t for t in tunnels if t["id"] == tunnel_id), None)
+        if not tunnel:
+            raise HTTPException(status_code=404, detail="Tunnel not found")
+    else:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Generate API Key - Terratunnel</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 40px; }}
+            .container {{ max-width: 600px; margin: 0 auto; }}
+            input[type="text"] {{ width: 100%; padding: 10px; margin: 10px 0; }}
+            button {{ padding: 10px 20px; background: #0066cc; color: white; border: none; cursor: pointer; }}
+            button:hover {{ background: #0052a3; }}
+            .warning {{ background: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; margin: 20px 0; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Generate API Key for {tunnel['name']}</h1>
+            <p>Tunnel: <code>{tunnel['subdomain']}.{manager.domain}</code></p>
+            
+            <div class="warning">
+                <strong>Warning:</strong> Generating a new API key will invalidate the existing key for this tunnel.
+            </div>
+            
+            <form action="/tunnels/{tunnel_id}/keys/generate" method="post">
+                <label for="name">API Key Name (optional):</label>
+                <input type="text" id="name" name="name" placeholder="e.g., Production Key">
+                <button type="submit">Generate API Key</button>
+                <a href="/" style="margin-left: 10px;">Cancel</a>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html)
+
+
+@app.post("/tunnels/{tunnel_id}/keys/generate")
+async def generate_tunnel_api_key(tunnel_id: int, request: Request, auth_token: Optional[str] = Cookie(None)):
+    """Generate a new API key for a tunnel"""
+    
+    from .auth import get_current_user_from_cookie
+    
+    user = await get_current_user_from_cookie(request, auth_token)
+    if not user:
+        return RedirectResponse(url="/auth/github", status_code=302)
+    
+    # Verify user owns this tunnel
+    if db:
+        tunnels = db.list_user_tunnels(user["id"])
+        tunnel = next((t for t in tunnels if t["id"] == tunnel_id), None)
+        if not tunnel:
+            raise HTTPException(status_code=404, detail="Tunnel not found")
+        
+        # Get form data
+        form_data = await request.form()
+        api_key_name = form_data.get("name", "").strip() or None
+        
+        # Generate API key
+        api_key = db.create_api_key_for_tunnel(tunnel_id, api_key_name)
+        
+        # Show the API key
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>API Key Generated - Terratunnel</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 40px; }}
+                .container {{ max-width: 600px; margin: 0 auto; }}
+                .api-key {{ background: #f8f9fa; padding: 20px; margin: 20px 0; font-family: monospace; word-break: break-all; }}
+                .warning {{ background: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; margin: 20px 0; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>API Key Generated</h1>
+                <p>For tunnel: <code>{tunnel['subdomain']}.{manager.domain}</code></p>
+                
+                <div class="warning">
+                    <strong>Important:</strong> This is the only time you'll see this API key. Copy it now!
+                </div>
+                
+                <div class="api-key">{api_key}</div>
+                
+                <p>Use this key with the terratunnel client:</p>
+                <pre>python -m terratunnel client \\
+    --api-key {api_key} \\
+    --local-endpoint http://localhost:3000</pre>
+                
+                <a href="/">Back to Dashboard</a>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return HTMLResponse(content=html)
+    
+    raise HTTPException(status_code=500, detail="Failed to generate API key")
 
 
 @app.get("/api/keys/new", response_class=HTMLResponse)
