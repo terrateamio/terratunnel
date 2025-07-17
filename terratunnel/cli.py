@@ -47,9 +47,11 @@ def server(host, port, domain, db_path):
               help="Automatically update GitHub App webhook URL when tunnel connects (env: TERRATUNNEL_UPDATE_GITHUB_WEBHOOK)")
 @click.option("--api-key", envvar="TERRATUNNEL_API_KEY",
               help="API key for authentication (env: TERRATUNNEL_API_KEY)")
-def client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key):
+@click.option("--request-log", envvar="TERRATUNNEL_REQUEST_LOG",
+              help="Path to request log file for detailed logging (env: TERRATUNNEL_REQUEST_LOG)")
+def client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key, request_log):
     """Connect to a tunnel server and forward requests to a local endpoint."""
-    run_client(server_url=server_url, local_endpoint=local_endpoint, dashboard=dashboard, dashboard_port=dashboard_port, api_port=api_port, update_github_webhook=update_github_webhook, api_key=api_key)
+    run_client(server_url=server_url, local_endpoint=local_endpoint, dashboard=dashboard, dashboard_port=dashboard_port, api_port=api_port, update_github_webhook=update_github_webhook, api_key=api_key, request_log=request_log)
 
 
 if __name__ == "__main__":

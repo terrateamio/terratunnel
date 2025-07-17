@@ -1484,7 +1484,12 @@ async def main_client(server_url: str, local_endpoint: str, dashboard: bool = Fa
                 pass
 
 
-def run_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False, api_key: Optional[str] = None):
+def run_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False, api_key: Optional[str] = None, request_log: Optional[str] = None):
+    # Set request log path if provided
+    if request_log:
+        import os
+        os.environ['TERRATUNNEL_REQUEST_LOG'] = request_log
+    
     try:
         asyncio.run(main_client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key))
     except KeyboardInterrupt:
