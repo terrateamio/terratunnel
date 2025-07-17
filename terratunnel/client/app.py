@@ -18,6 +18,7 @@ import uvicorn
 import jwt
 
 from .request_logger import RequestLogger
+from ..utils import is_binary_content
 
 # Suppress uvicorn's shutdown errors
 logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
@@ -209,28 +210,6 @@ class TunnelClient:
             duration_str = f" {duration_ms:.0f}ms" if duration_ms is not None else ""
             logger.info(f"[{timestamp}] {method} {path} -> {status_code}{duration_str}")
 
-    def _is_binary_content(self, content_type: str) -> bool:
-        """Determine if content type indicates binary data."""
-        # Common binary content types
-        binary_types = [
-            'image/', 'audio/', 'video/', 'application/pdf',
-            'application/zip', 'application/x-zip', 'application/x-zip-compressed',
-            'application/octet-stream', 'application/x-tar', 'application/x-gzip',
-            'application/x-bzip2', 'application/x-7z-compressed',
-            'application/vnd.ms-excel', 'application/vnd.openxmlformats',
-            'application/msword', 'application/vnd.ms-powerpoint',
-            'application/x-rar-compressed', 'application/java-archive',
-            'application/x-shockwave-flash', 'application/x-msdownload',
-            'application/x-deb', 'application/x-rpm'
-        ]
-        
-        for binary_type in binary_types:
-            if content_type.startswith(binary_type):
-                return True
-        
-        # Also check for common binary file extensions in content-disposition
-        # This helps when content-type is generic like 'application/octet-stream'
-        return False
 
     async def handle_request(self, request_data: dict) -> dict:
         try:
@@ -258,7 +237,7 @@ class TunnelClient:
                 
                 # Check if response is binary based on content-type
                 content_type = response.headers.get("content-type", "").lower()
-                is_binary = self._is_binary_content(content_type)
+                is_binary = is_binary_content(content_type)
                 
                 response_data = {
                     "status_code": response.status_code,
