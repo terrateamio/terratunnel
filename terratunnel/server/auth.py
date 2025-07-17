@@ -41,7 +41,7 @@ def generate_state() -> str:
     
     # Clean up old states (older than 10 minutes)
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
-    expired_states = [s for s, t in oauth_states.items() if t < cutoff]
+    expired_states = [s for s, t in oauth_states.items() if isinstance(t, datetime) and t < cutoff]
     for state in expired_states:
         del oauth_states[state]
     
@@ -259,7 +259,6 @@ async def github_oauth_callback(
         # This is from the OAuth proxy - create tunnel and redirect back with all data
         try:
             # Check if user is admin
-            from .config import Config
             is_admin = Config.is_admin_user("github", user["provider_username"])
             
             # Create API key for the user
