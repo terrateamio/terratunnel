@@ -17,6 +17,8 @@ from fastapi.responses import HTMLResponse
 import uvicorn
 import jwt
 
+from .request_logger import RequestLogger
+
 # Suppress uvicorn's shutdown errors
 logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
 
@@ -46,6 +48,9 @@ class TunnelClient:
         self.reconnect_delay = 1  # Initial reconnect delay in seconds
         self.max_reconnect_delay = 60  # Maximum reconnect delay
         self.reconnect_attempts = 0
+        
+        # Initialize request logger
+        self.request_logger = RequestLogger()
         
         parsed = urlparse(server_url)
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
@@ -170,125 +175,22 @@ class TunnelClient:
             if len(self.webhook_history) > self.max_history:
                 self.webhook_history.pop()  # Remove oldest
 
-    def _log_request(self, request_data: dict, response_data: dict):
-        """Log complete request and response details to console for user visibility"""
-        method = request_data.get("method", "GET")
-        path = request_data.get("path", "/")
-        status_code = response_data.get("status_code", 0)
+    def _log_request(self, request_data: dict, response_data: dict, duration_ms: Optional[float] = None):
+        """Log request to file and display concise access log to console.
         
-        # Status indicators without emojis
-        if status_code >= 200 and status_code < 300:
-            status_indicator = "SUCCESS"
-        elif status_code >= 300 and status_code < 400:
-            status_indicator = "REDIRECT"
-        elif status_code >= 400 and status_code < 500:
-            status_indicator = "CLIENT_ERROR"
-        else:
-            status_indicator = "SERVER_ERROR"
+        Args:
+            request_data: Request details
+            response_data: Response details  
+            duration_ms: Request duration in milliseconds (optional)
+        """
+        # Log full details to file and get request ID
+        request_id = self.request_logger.log_request(request_data, response_data)
         
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        # Main request line
-        query_params = request_data.get("query_params", {})
-        query_str = ""
-        if query_params:
-            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
-        
-        logger.info(f"[{timestamp}] {status_indicator} {method} {path}{query_str} -> {status_code}")
-        
-        # Request headers
-        request_headers = request_data.get("headers", {})
-        if request_headers:
-            logger.info("  Request Headers:")
-            for key, value in request_headers.items():
-                # Truncate very long header values
-                display_value = value[:200] + "..." if len(str(value)) > 200 else value
-                logger.info(f"    {key}: {display_value}")
-        
-        # Request body
-        request_body = request_data.get("body", "")
-        if request_body:
-            logger.info("  Request Body:")
-            # Pretty print JSON if possible
-            try:
-                import json
-                if request_headers.get("content-type", "").startswith("application/json"):
-                    parsed = json.loads(request_body)
-                    formatted = json.dumps(parsed, indent=2)
-                    # Limit body size in logs
-                    if len(formatted) > 1000:
-                        lines = formatted.split('\n')
-                        if len(lines) > 20:
-                            truncated = '\n'.join(lines[:20]) + f"\n    ... ({len(lines) - 20} more lines)"
-                        else:
-                            truncated = formatted[:1000] + "..."
-                        logger.info(f"    {truncated}")
-                    else:
-                        for line in formatted.split('\n'):
-                            logger.info(f"    {line}")
-                else:
-                    # Non-JSON body
-                    if len(request_body) > 500:
-                        logger.info(f"    {request_body[:500]}...")
-                    else:
-                        logger.info(f"    {request_body}")
-            except:
-                # Fallback for invalid JSON or other issues
-                if len(request_body) > 500:
-                    logger.info(f"    {request_body[:500]}...")
-                else:
-                    logger.info(f"    {request_body}")
-        
-        # Response headers
-        response_headers = response_data.get("headers", {})
-        if response_headers:
-            logger.info("  Response Headers:")
-            for key, value in response_headers.items():
-                # Truncate very long header values
-                display_value = value[:200] + "..." if len(str(value)) > 200 else value
-                logger.info(f"    {key}: {display_value}")
-        
-        # Response body
-        response_body = response_data.get("body", "")
-        if response_body:
-            logger.info("  Response Body:")
-            
-            # Check if response is binary
-            if response_data.get("is_binary"):
-                logger.info(f"    [Binary data: {len(response_body)} bytes base64-encoded]")
-            else:
-                # Pretty print JSON if possible
-                try:
-                    import json
-                    if response_headers.get("content-type", "").startswith("application/json"):
-                        parsed = json.loads(response_body)
-                        formatted = json.dumps(parsed, indent=2)
-                        # Limit body size in logs
-                        if len(formatted) > 1000:
-                            lines = formatted.split('\n')
-                            if len(lines) > 20:
-                                truncated = '\n'.join(lines[:20]) + f"\n    ... ({len(lines) - 20} more lines)"
-                            else:
-                                truncated = formatted[:1000] + "..."
-                            logger.info(f"    {truncated}")
-                        else:
-                            for line in formatted.split('\n'):
-                                logger.info(f"    {line}")
-                    else:
-                        # Non-JSON body
-                        if len(response_body) > 500:
-                            logger.info(f"    {response_body[:500]}...")
-                        else:
-                            logger.info(f"    {response_body}")
-                except:
-                    # Fallback for invalid JSON or other issues
-                    if len(response_body) > 500:
-                        logger.info(f"    {response_body[:500]}...")
-                    else:
-                        logger.info(f"    {response_body}")
-        
-        # Add separator line for readability
-        logger.info("  " + "-" * 80)
+        # Display concise access log to console
+        access_log = self.request_logger.format_access_log(
+            request_data, response_data, request_id, duration_ms
+        )
+        logger.info(access_log)
 
     def _is_binary_content(self, content_type: str) -> bool:
         """Determine if content type indicates binary data."""
@@ -354,9 +256,6 @@ class TunnelClient:
                     response_data["body"] = response.text
                     response_data["is_binary"] = False
                 
-                # Log request details for user visibility
-                self._log_request(request_data, response_data)
-                
                 # Record webhook for dashboard
                 self._record_webhook(request_data, response_data)
                 
@@ -371,10 +270,7 @@ class TunnelClient:
                 "is_binary": False
             }
             
-            # Log error request
-            self._log_request(request_data, error_response)
-            
-            # Record error for dashboard too
+            # Record error for dashboard
             self._record_webhook(request_data, error_response)
             
             return error_response
@@ -420,8 +316,13 @@ class TunnelClient:
                             self.last_keepalive = time.time()
                         continue
                     
-                    # Handle HTTP request
+                    # Handle HTTP request and track duration
+                    start_time = time.time()
                     response_data = await self.handle_request(request_data)
+                    duration_ms = (time.time() - start_time) * 1000
+                    
+                    # Log request with duration
+                    self._log_request(request_data, response_data, duration_ms)
                     
                     # Include request_id in response if present
                     if request_data.get("request_id"):
