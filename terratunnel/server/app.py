@@ -11,7 +11,7 @@ import base64
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, Cookie
 from fastapi.routing import APIRoute
-from fastapi.responses import JSONResponse, Response, HTMLResponse, RedirectResponse
+from fastapi.responses import JSONResponse, Response, HTMLResponse, RedirectResponse, StreamingResponse
 import uvicorn
 from coolname import generate_slug
 from .database import Database
@@ -20,9 +20,76 @@ from .auth import auth_router, require_admin_user, set_database as set_auth_data
 from .api import api_router, set_database as set_api_database
 from .middleware import AuthMiddleware
 from ..utils import is_binary_content
+from ..streaming import StreamReceiver, StreamMetadata
 
 
 logger = logging.getLogger("terratunnel-server")
+
+
+class StreamingRequest:
+    """Handles streaming response data."""
+    def __init__(self, request_id: str):
+        self.request_id = request_id
+        self.metadata_future = asyncio.Future()
+        self.chunk_queue = asyncio.Queue()
+        self.is_complete = False
+        self.error = None
+
+
+class StreamHandler:
+    """Handles a single streaming response."""
+    def __init__(self, request_id: str):
+        self.request_id = request_id
+        self.metadata_event = asyncio.Event()
+        self.metadata = None
+        self.chunk_queue = asyncio.Queue()
+        self.is_complete = False
+        self.error = None
+        self.stream_id = None
+        
+    async def wait_for_metadata(self, timeout: float = 30.0):
+        """Wait for response metadata."""
+        try:
+            await asyncio.wait_for(self.metadata_event.wait(), timeout=timeout)
+            return self.metadata
+        except asyncio.TimeoutError:
+            return None
+    
+    def set_metadata(self, metadata: dict, stream_id: str = None):
+        """Set response metadata."""
+        self.metadata = metadata
+        self.stream_id = stream_id
+        self.metadata_event.set()
+    
+    async def add_chunk(self, data: bytes):
+        """Add a chunk to the stream."""
+        await self.chunk_queue.put(data)
+    
+    async def complete(self):
+        """Mark stream as complete."""
+        self.is_complete = True
+        await self.chunk_queue.put(None)
+    
+    async def error(self, error_msg: str):
+        """Mark stream as errored."""
+        self.error = error_msg
+        self.is_complete = True
+        await self.chunk_queue.put(None)
+    
+    async def stream_chunks(self):
+        """Yield chunks as they arrive."""
+        while True:
+            try:
+                chunk = await asyncio.wait_for(self.chunk_queue.get(), timeout=60.0)
+                if chunk is None:
+                    break
+                yield chunk
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout waiting for chunk in stream {self.request_id}")
+                break
+            except Exception as e:
+                logger.error(f"Error streaming chunk: {e}")
+                break
 
 
 class ConnectionManager:
@@ -31,8 +98,11 @@ class ConnectionManager:
         self.hostname_to_subdomain: Dict[str, str] = {}
         self.subdomain_to_endpoint: Dict[str, str] = {}
         self.pending_requests: Dict[str, asyncio.Future] = {}
+        self.streaming_requests: Dict[str, StreamingRequest] = {}  # For streaming responses
         self.domain = domain
         self.lock = threading.Lock()
+        self.stream_receivers: Dict[str, StreamReceiver] = {}  # Track active stream receivers
+        self.stream_handlers: Dict[str, StreamHandler] = {}  # Stream handlers for new architecture
 
     def generate_subdomain(self) -> str:
         """Generate a human-readable subdomain for anonymous users"""
@@ -84,50 +154,378 @@ class ConnectionManager:
             self.subdomain_to_endpoint[subdomain] = endpoint
 
     async def send_request(self, subdomain: str, request_data: dict) -> Optional[dict]:
+        # Generate unique request ID
+        request_id = str(uuid.uuid4())
+        request_data["request_id"] = request_id
+        
         with self.lock:
             websocket = self.active_connections.get(subdomain)
         
         if not websocket:
+            logger.error(f"[{request_id}] No active WebSocket connection for subdomain {subdomain}")
             return None
         
-        # Generate unique request ID
-        request_id = str(uuid.uuid4())
-        request_data["request_id"] = request_id
+        method = request_data.get("method", "GET")
+        path = request_data.get("path", "/")
+        logger.debug(f"[{request_id}] Sending {method} {path} to {subdomain}")
         
         # Create future for response
         future = asyncio.Future()
         
         with self.lock:
             self.pending_requests[request_id] = future
+            pending_count = len(self.pending_requests)
+        
+        logger.debug(f"[{request_id}] Added to pending requests (total pending: {pending_count})")
         
         try:
             await websocket.send_text(json.dumps(request_data))
+            logger.debug(f"[{request_id}] Request sent via WebSocket, waiting for response...")
             # Wait for response with timeout
-            response = await asyncio.wait_for(future, timeout=30.0)
+            response = await asyncio.wait_for(future, timeout=600.0)  # 10 minutes for large files
+            logger.debug(f"[{request_id}] Response received")
             return response
         except asyncio.TimeoutError:
-            logger.error(f"Timeout waiting for response from {subdomain}")
+            logger.error(f"[{request_id}] Timeout waiting for response from {subdomain} (waited 10 minutes)")
             with self.lock:
                 self.pending_requests.pop(request_id, None)
             self.disconnect(subdomain)
             return None
         except Exception as e:
-            logger.error(f"Error sending request to {subdomain}: {e}")
+            logger.error(f"[{request_id}] Error sending request to {subdomain}: {e}")
             with self.lock:
                 self.pending_requests.pop(request_id, None)
             self.disconnect(subdomain)
             return None
 
-    def handle_response(self, response_data: dict):
+    async def create_streaming_response(self, subdomain: str, request_data: dict):
+        """Create a streaming response using the new architecture."""
+        request_id = str(uuid.uuid4())
+        request_data["request_id"] = request_id
+        
+        # Create stream handler
+        handler = StreamHandler(request_id)
+        with self.lock:
+            self.stream_handlers[request_id] = handler
+        
+        try:
+            # Send request
+            with self.lock:
+                websocket = self.active_connections.get(subdomain)
+            
+            if not websocket:
+                raise Exception("No active WebSocket connection")
+            
+            await websocket.send_text(json.dumps(request_data))
+            
+            # Wait for metadata
+            metadata = await handler.wait_for_metadata()
+            if not metadata:
+                raise Exception("Timeout waiting for response metadata")
+            
+            # Return metadata and handler
+            return metadata, handler
+            
+        except Exception as e:
+            # Cleanup on error
+            with self.lock:
+                self.stream_handlers.pop(request_id, None)
+            raise
+
+    async def handle_stream_chunk(self, subdomain: str, message: dict):
+        """Handle incoming stream chunk."""
+        stream_id = message.get("stream_id")
+        
+        logger.debug(f"[SERVER-STREAM] handle_stream_chunk called for stream {stream_id} from subdomain {subdomain}")
+        logger.debug(f"[SERVER-STREAM] Message keys: {list(message.keys())}")
+        logger.debug(f"[SERVER-STREAM] Chunk data keys: {list(message.get('chunk', {}).keys())}")
+        
+        # Find the stream receiver
+        receiver = None
+        receiver_key = None
+        with self.lock:
+            logger.debug(f"[SERVER-STREAM] Looking for receiver for stream {stream_id} from subdomain {subdomain}")
+            logger.debug(f"[SERVER-STREAM] Active receivers: {list(self.stream_receivers.keys())}")
+            for recv_id, recv in self.stream_receivers.items():
+                logger.debug(f"[SERVER-STREAM] Checking receiver {recv_id}, active streams: {list(recv.active_streams.keys())}")
+                if recv_id.startswith(f"{subdomain}:") and stream_id in recv.active_streams:
+                    receiver = recv
+                    receiver_key = recv_id
+                    logger.debug(f"[SERVER-STREAM] Found matching receiver!")
+                    break
+        
+        if receiver:
+            logger.debug(f"[SERVER-STREAM] Found receiver {receiver_key} for stream {stream_id}")
+            
+            # Let receiver handle the chunk
+            receiver.handle_chunk(message)
+            
+            # Check if we have a stream handler
+            stream_handler = getattr(receiver, 'stream_handler', None)
+            if stream_handler:
+                # Forward decoded chunk to handler
+                chunk_data = message.get("chunk", {})
+                if chunk_data.get("data"):
+                    try:
+                        decoded_data = base64.b64decode(chunk_data["data"])
+                        await stream_handler.add_chunk(decoded_data)
+                        logger.debug(f"[SERVER-STREAM] Added chunk to stream handler")
+                    except Exception as e:
+                        logger.error(f"Error decoding chunk: {e}")
+                        await stream_handler.error(str(e))
+        else:
+            logger.warning(f"[SERVER-STREAM] No receiver found for stream {stream_id} from subdomain {subdomain}")
+    
+    async def handle_stream_complete(self, subdomain: str, message: dict):
+        """Handle stream completion."""
+        stream_id = message.get("stream_id")
+        
+        logger.debug(f"[SERVER-STREAM] handle_stream_complete called for stream {stream_id} from subdomain {subdomain}")
+        logger.debug(f"[SERVER-STREAM] Completion message: {message}")
+        
+        # Find the stream receiver
+        receiver = None
+        with self.lock:
+            logger.debug(f"[SERVER-STREAM] Looking for receiver for completed stream {stream_id}")
+            logger.debug(f"[SERVER-STREAM] Available receivers: {list(self.stream_receivers.keys())}")
+            for recv_id, recv in self.stream_receivers.items():
+                logger.debug(f"[SERVER-STREAM] Checking receiver {recv_id}, active streams: {list(recv.active_streams.keys())}")
+                if recv_id.startswith(f"{subdomain}:") and stream_id in recv.active_streams:
+                    receiver = recv
+                    logger.debug(f"[SERVER-STREAM] Found receiver {recv_id} for completed stream")
+                    break
+        
+        if receiver:
+            # Check if we have a stream handler
+            stream_handler = getattr(receiver, 'stream_handler', None)
+            if stream_handler:
+                # New streaming architecture - just mark complete
+                logger.debug(f"[SERVER-STREAM] Using new streaming architecture for completion")
+                receiver.handle_complete(message)
+                await stream_handler.complete()
+                
+                # Cleanup
+                with self.lock:
+                    # Find and remove receiver
+                    for recv_id, recv in list(self.stream_receivers.items()):
+                        if recv == receiver:
+                            del self.stream_receivers[recv_id]
+                            break
+                    # Remove stream handler
+                    self.stream_handlers.pop(stream_handler.request_id, None)
+                logger.info(f"Stream {stream_id} completed successfully")
+            elif receiver.handle_complete(message):
+                logger.debug(f"[SERVER-STREAM] handle_complete returned True, getting assembled data")
+                # Get the complete data
+                data = receiver.get_assembled_data(stream_id)
+                logger.debug(f"[SERVER-STREAM] get_assembled_data returned: {type(data)}, size={len(data) if data else 'None'}")
+                stream = receiver.active_streams.get(stream_id)
+                
+                if data is not None and stream and "request_future" in stream:
+                    future = stream["request_future"]
+                    if not future.done():
+                        try:
+                            # Check if stream took too long (safety check)
+                            start_time = stream.get("start_time", 0)
+                            current_time = asyncio.get_event_loop().time()
+                            duration = current_time - start_time
+                            
+                            # Validate assembled data
+                            if len(data) == 0:
+                                logger.error(f"Stream {stream_id} assembled data is empty")
+                                if not future.done():
+                                    future.set_exception(Exception("Stream assembly failed: empty data"))
+                                receiver.cleanup_stream(stream_id)
+                                return
+                            
+                            # Check if data size matches expected size
+                            metadata = stream.get("metadata")
+                            if metadata and hasattr(metadata, "total_size"):
+                                expected_size = metadata.total_size
+                            else:
+                                expected_size = 0
+                            if expected_size > 0 and len(data) != expected_size:
+                                logger.warning(f"Stream {stream_id} size mismatch: expected {expected_size}, got {len(data)}")
+                                # Don't fail on size mismatch, just log it
+                            
+                            # Create response with assembled data
+                            response_data = {
+                                "status_code": stream.get("status_code", 200),
+                                "headers": stream.get("headers", {}),
+                                "body": base64.b64encode(data).decode('ascii'),
+                                "is_binary": True
+                            }
+                            future.set_result(response_data)
+                            logger.info(f"Stream {stream_id} completed, response delivered ({len(data)} bytes, took {duration:.2f}s)")
+                            
+                            # Schedule cleanup after a short delay to allow response processing
+                            def delayed_cleanup():
+                                try:
+                                    receiver.cleanup_stream(stream_id)
+                                    logger.debug(f"Stream {stream_id} cleaned up after response delivery")
+                                except Exception as cleanup_error:
+                                    logger.error(f"Error during delayed cleanup of stream {stream_id}: {cleanup_error}")
+                            
+                            # Schedule cleanup with a small delay
+                            asyncio.get_event_loop().call_later(0.1, delayed_cleanup)
+                            
+                        except Exception as e:
+                            logger.error(f"Error creating response for stream {stream_id}: {e}")
+                            if not future.done():
+                                future.set_exception(Exception(f"Stream assembly failed: {e}"))
+                            # Clean up immediately on error
+                            receiver.cleanup_stream(stream_id)
+                    else:
+                        logger.warning(f"Stream {stream_id} completed but future already done")
+                        # Clean up if future is already done
+                        receiver.cleanup_stream(stream_id)
+                elif data is None:
+                    logger.error(f"Stream {stream_id} completed but assembled data is None")
+                    if stream and "request_future" in stream:
+                        future = stream["request_future"]
+                        if not future.done():
+                            future.set_exception(Exception("Stream assembly failed: missing data"))
+                    # Clean up on error
+                    receiver.cleanup_stream(stream_id)
+                else:
+                    logger.error(f"Stream {stream_id} completed but stream or future not found")
+                    # Clean up on error
+                    receiver.cleanup_stream(stream_id)
+            else:
+                logger.error(f"Stream {stream_id} completion failed validation")
+                # Handle failed completion
+                stream = receiver.active_streams.get(stream_id)
+                if stream and "request_future" in stream:
+                    future = stream["request_future"]
+                    if not future.done():
+                        future.set_exception(Exception("Stream completion failed validation"))
+                receiver.cleanup_stream(stream_id)
+        else:
+            logger.warning(f"No receiver found for completed stream {stream_id} from subdomain {subdomain}")
+    
+    def handle_stream_error(self, subdomain: str, message: dict):
+        """Handle stream error."""
+        stream_id = message.get("stream_id")
+        
+        # Find the stream receiver
+        receiver = None
+        with self.lock:
+            for recv_id, recv in self.stream_receivers.items():
+                if recv_id.startswith(f"{subdomain}:") and stream_id in recv.active_streams:
+                    receiver = recv
+                    break
+        
+        if receiver:
+            receiver.handle_error(message)
+            # Find the pending request and error it
+            stream = receiver.active_streams.get(stream_id)
+            if stream and "request_future" in stream:
+                future = stream["request_future"]
+                if not future.done():
+                    future.set_exception(Exception(message.get("error", "Stream error")))
+
+    def handle_response(self, response_data: dict, subdomain: str = None):
         request_id = response_data.get("request_id")
         if not request_id:
+            logger.warning("Received response without request_id")
             return
         
-        with self.lock:
-            future = self.pending_requests.pop(request_id, None)
+        logger.debug(f"[{request_id}] Received response from client")
         
-        if future and not future.done():
-            future.set_result(response_data)
+        # Check if we have a stream handler waiting for this
+        with self.lock:
+            stream_handler = self.stream_handlers.get(request_id)
+        
+        if stream_handler:
+            # New streaming architecture
+            logger.debug(f"[{request_id}] Using new streaming architecture")
+            
+            if response_data.get("is_streaming"):
+                # Set metadata on the handler
+                stream_info = response_data.get("stream", {})
+                stream_id = stream_info.get("id")
+                stream_handler.set_metadata(response_data, stream_id)
+                
+                # Still need to set up receiver for chunk handling
+                if stream_id:
+                    receiver_key = f"{subdomain}:{request_id}"
+                    with self.lock:
+                        if receiver_key not in self.stream_receivers:
+                            self.stream_receivers[receiver_key] = StreamReceiver()
+                        receiver = self.stream_receivers[receiver_key]
+                        # Link handler to receiver
+                        self.stream_receivers[receiver_key].stream_handler = stream_handler
+                    
+                    # Initialize the stream
+                    metadata = StreamMetadata(
+                        stream_id=stream_id,
+                        request_id=request_id,
+                        total_size=stream_info.get("total_size", 0),
+                        total_chunks=0,
+                        content_type=stream_info.get("content_type", "")
+                    )
+                    receiver.start_stream(metadata, None)
+                    receiver.active_streams[stream_id]["receiver_key"] = receiver_key
+                    logger.info(f"[{request_id}] Started streaming response for stream {stream_id}")
+            else:
+                # Non-streaming response - set it directly
+                stream_handler.set_metadata(response_data)
+        else:
+            # Old architecture - check for future
+            with self.lock:
+                future = self.pending_requests.pop(request_id, None)
+                pending_count = len(self.pending_requests)
+            
+            logger.debug(f"[{request_id}] Removed from pending requests (remaining: {pending_count})")
+            
+            if future and not future.done():
+                # Check if this is a streaming response
+                if response_data.get("is_streaming"):
+                    # Create a stream receiver for this stream
+                    stream_info = response_data.get("stream", {})
+                    stream_id = stream_info.get("id")
+                    
+                    if stream_id:
+                        # Create receiver key with subdomain prefix
+                        receiver_key = f"{subdomain}:{request_id}"
+                        
+                        with self.lock:
+                            if receiver_key not in self.stream_receivers:
+                                self.stream_receivers[receiver_key] = StreamReceiver()
+                            
+                            receiver = self.stream_receivers[receiver_key]
+                        
+                        # Initialize the stream
+                        metadata = StreamMetadata(
+                            stream_id=stream_id,
+                            request_id=request_id,
+                            total_size=stream_info.get("total_size", 0),
+                            total_chunks=0,  # Will be updated by chunks
+                            content_type=stream_info.get("content_type", "")
+                        )
+                        
+                        logger.debug(f"[SERVER-STREAM-INIT] Creating stream metadata: stream_id={stream_id}, request_id={request_id}, total_size={metadata.total_size}")
+                        
+                        receiver.start_stream(metadata, None)
+                        
+                        # Store the future in the stream for later completion
+                        receiver.active_streams[stream_id]["request_future"] = future
+                        receiver.active_streams[stream_id]["status_code"] = response_data.get("status_code", 200)
+                        receiver.active_streams[stream_id]["headers"] = response_data.get("headers", {})
+                        receiver.active_streams[stream_id]["subdomain"] = subdomain
+                        receiver.active_streams[stream_id]["start_time"] = asyncio.get_event_loop().time()
+                        
+                        logger.debug(f"[SERVER-STREAM-INIT] Stream {stream_id} initialized with future and metadata")
+                        logger.info(f"[{request_id}] Started receiving stream {stream_id} with receiver key {receiver_key}")
+                    else:
+                        # No stream ID, complete with error
+                        future.set_exception(Exception("Streaming response missing stream ID"))
+                else:
+                    # Regular response
+                    future.set_result(response_data)
+                    logger.debug(f"[{request_id}] Response delivered to waiting request")
+            else:
+                logger.warning(f"[{request_id}] No waiting future found or future already done")
 
 
 app = FastAPI(title="Tunnel Server")
@@ -349,11 +747,29 @@ async def websocket_endpoint(websocket: WebSocket):
                 message_text = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
                 message = json.loads(message_text)
                 
-                if message.get("type") == "keepalive_ack":
+                message_type = message.get("type")
+                logger.debug(f"[SERVER-WS] Received WebSocket message type: {message_type}")
+                logger.debug(f"[SERVER-WS] Full message keys: {list(message.keys())}")
+                
+                if message_type == "keepalive_ack":
+                    continue
+                elif message_type == "stream_chunk":
+                    logger.debug(f"[SERVER-WS] Handling stream_chunk message")
+                    # Handle streaming chunk
+                    await manager.handle_stream_chunk(subdomain, message)
+                    continue
+                elif message_type == "stream_complete":
+                    # Handle stream completion
+                    logger.debug(f"Received stream_complete message: {message}")
+                    await manager.handle_stream_complete(subdomain, message)
+                    continue
+                elif message_type == "stream_error":
+                    # Handle stream error
+                    manager.handle_stream_error(subdomain, message)
                     continue
                 elif message.get("request_id"):
                     # Handle response from client
-                    manager.handle_response(message)
+                    manager.handle_response(message, subdomain)
                     continue
                     
             except asyncio.TimeoutError:
@@ -1514,32 +1930,26 @@ async def admin_api_audit(request: Request, current_user = Depends(require_admin
 
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
-async def proxy_request(request: Request, path: str):
-    # Skip if manager not initialized (during startup)
+async def proxy_request_streaming(request: Request, path: str):
+    """Handle proxy requests with proper streaming support."""
     if not manager:
         raise HTTPException(status_code=503, detail="Service starting up")
     
     host_header = request.headers.get("host", "")
-    logger.debug(f"Proxy request - Host: {host_header}, Path: {path}")
-    
     if not host_header:
         raise HTTPException(status_code=400, detail="Host header required")
     
-    # Strip port from host header if present (e.g., "example.com:8000" -> "example.com")
-    # Normalize to lowercase for consistent lookup
     hostname = host_header.split(':')[0].lower()
-    
-    
     subdomain = manager.get_subdomain_from_hostname(hostname)
     if not subdomain:
-        logger.debug(f"Subdomain lookup failed for hostname: {hostname}")
-        logger.debug(f"Available hostnames: {list(manager.hostname_to_subdomain.keys())}")
         raise HTTPException(status_code=404, detail=f"Tunnel {hostname} not found")
     
+    # Prepare request data
     body = await request.body()
+    MAX_REQUEST_SIZE = int(os.environ.get('TERRATUNNEL_MAX_REQUEST_SIZE', str(50 * 1024 * 1024)))
+    if len(body) > MAX_REQUEST_SIZE:
+        raise HTTPException(status_code=413, detail=f"Request body too large")
     
-    # Check if request contains binary data
     content_type = request.headers.get("content-type", "").lower()
     is_binary_request = is_binary_content(content_type)
     
@@ -1552,7 +1962,6 @@ async def proxy_request(request: Request, path: str):
     
     if body:
         if is_binary_request:
-            # Encode binary data as base64
             request_data["body"] = base64.b64encode(body).decode('ascii')
             request_data["is_binary"] = True
         else:
@@ -1560,42 +1969,95 @@ async def proxy_request(request: Request, path: str):
                 request_data["body"] = body.decode('utf-8')
                 request_data["is_binary"] = False
             except UnicodeDecodeError:
-                # Fallback to base64 if decode fails
                 request_data["body"] = base64.b64encode(body).decode('ascii')
                 request_data["is_binary"] = True
     else:
         request_data["body"] = ""
         request_data["is_binary"] = False
     
-    response_data = await manager.send_request(subdomain, request_data)
-    
-    if response_data is None:
-        raise HTTPException(status_code=502, detail="Service unavailable")
-    
-    # Filter out headers that FastAPI should not set manually
-    response_headers = response_data.get("headers", {})
-    filtered_headers = {}
-    
-    # Skip headers that cause conflicts with FastAPI's response handling
-    skip_headers = {"content-length", "transfer-encoding", "connection"}
-    
-    for key, value in response_headers.items():
-        if key.lower() not in skip_headers:
-            filtered_headers[key] = value
-    
-    # Handle binary response data
-    response_body = response_data.get("body", "")
-    if response_data.get("is_binary") and response_body:
-        # Decode base64 back to binary
-        content = base64.b64decode(response_body)
-    else:
-        content = response_body
-    
-    return Response(
-        content=content,
-        status_code=response_data.get("status_code", 200),
-        headers=filtered_headers
-    )
+    # Try streaming approach first
+    try:
+        metadata, handler = await manager.create_streaming_response(subdomain, request_data)
+        
+        if metadata.get("is_streaming"):
+            # Return streaming response
+            status_code = metadata.get("status_code", 200)
+            headers = metadata.get("headers", {})
+            
+            # Filter headers
+            filtered_headers = {}
+            skip_headers = {"content-length", "transfer-encoding", "connection"}
+            for key, value in headers.items():
+                if key.lower() not in skip_headers:
+                    filtered_headers[key] = value
+            
+            return StreamingResponse(
+                handler.stream_chunks(),
+                status_code=status_code,
+                headers=filtered_headers,
+                media_type=headers.get("content-type", "application/octet-stream")
+            )
+        else:
+            # Non-streaming response
+            response_data = metadata
+            
+            # Filter headers
+            response_headers = response_data.get("headers", {})
+            filtered_headers = {}
+            skip_headers = {"content-length", "transfer-encoding", "connection"}
+            for key, value in response_headers.items():
+                if key.lower() not in skip_headers:
+                    filtered_headers[key] = value
+            
+            # Handle body
+            response_body = response_data.get("body", "")
+            status_code = response_data.get("status_code", 200)
+            
+            if response_data.get("is_binary") and response_body:
+                content = base64.b64decode(response_body)
+            else:
+                content = response_body
+            
+            return Response(
+                content=content,
+                status_code=status_code,
+                headers=filtered_headers
+            )
+    except Exception as e:
+        logger.error(f"Error in streaming proxy: {e}")
+        # Fall back to old method
+        response_data = await manager.send_request(subdomain, request_data)
+        
+        if response_data is None:
+            raise HTTPException(status_code=502, detail="Service unavailable")
+        
+        # [Rest of original proxy_request code for fallback]
+        response_headers = response_data.get("headers", {})
+        filtered_headers = {}
+        skip_headers = {"content-length", "transfer-encoding", "connection"}
+        for key, value in response_headers.items():
+            if key.lower() not in skip_headers:
+                filtered_headers[key] = value
+        
+        response_body = response_data.get("body", "")
+        status_code = response_data.get("status_code", 200)
+        
+        if response_data.get("is_binary") and response_body:
+            content = base64.b64decode(response_body)
+        else:
+            content = response_body
+        
+        return Response(
+            content=content,
+            status_code=status_code,
+            headers=filtered_headers
+        )
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+async def proxy_request(request: Request, path: str):
+    # Use the new streaming proxy
+    return await proxy_request_streaming(request, path)
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.terrateam.dev", vcs_only: bool = False, validate_endpoint: bool = False, db_path: Optional[str] = None):
@@ -1638,6 +2100,7 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.te
         host=host, 
         port=port, 
         access_log=False,  # Disable default HTTP access logs
+        ws_max_size=512 * 1024 * 1024,  # 512MB max WebSocket message size
         log_config={
             "version": 1,
             "disable_existing_loggers": False,
