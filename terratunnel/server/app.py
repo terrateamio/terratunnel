@@ -158,6 +158,68 @@ async def subdomain_proxy_middleware(request: Request, call_next):
             
             # Call the proxy handler directly
             return await proxy_request(request, path)
+        else:
+            # Subdomain doesn't exist - return error page
+            error_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Tunnel Not Found</title>
+                <style>
+                    @font-face {{
+                        font-family: 'Apertura';
+                        src: url('/fonts/Apertura_Regular.otf') format('opentype');
+                        font-weight: 400;
+                        font-style: normal;
+                    }}
+                    body {{
+                        font-family: 'Apertura', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                        margin: 0;
+                        padding: 0;
+                        background: #f5f5f5;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        min-height: 100vh;
+                    }}
+                    .container {{
+                        max-width: 500px;
+                        background: white;
+                        padding: 40px;
+                        border-radius: 8px;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                        text-align: center;
+                    }}
+                    h1 {{
+                        margin-top: 0;
+                        color: #333;
+                        font-size: 48px;
+                    }}
+                    p {{
+                        color: #666;
+                        line-height: 1.6;
+                        margin: 20px 0;
+                        font-size: 18px;
+                    }}
+                    .hostname {{
+                        font-family: monospace;
+                        background: #f6f8fa;
+                        padding: 4px 8px;
+                        border-radius: 4px;
+                        color: #0066cc;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>404</h1>
+                    <p>Tunnel <span class="hostname">{hostname}</span> doesn't exist.</p>
+                    <p>This tunnel may have been disconnected or never existed.</p>
+                </div>
+            </body>
+            </html>
+            """
+            return HTMLResponse(content=error_html, status_code=404)
     
     # Not a subdomain request, continue with normal routes
     return await call_next(request)
