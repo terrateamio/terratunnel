@@ -361,8 +361,16 @@ Terratunnel automatically handles large file transfers using a chunked streaming
    - WebSocket message size increased to 512MB to support large transfers
 
 8. **Admin Features Update**:
-   - Removed separate admin dashboard at /_admin
+   - Removed separate admin dashboard at /_admin  
    - Integrated admin features into main dashboard at /
-   - Admin users can create multiple tunnels using `--subdomain` flag
-   - Example: `python -m terratunnel client --subdomain custom-name --local-endpoint http://localhost:3000`
+   - Admin users can create multiple API keys (regular users limited to one)
+   - Each API key can be used to create a separate tunnel
    - Admin dashboard shows all active tunnels and recent connections
+   - Example: Admin users can run multiple tunnels by using different API keys:
+     ```bash
+     # Terminal 1
+     python -m terratunnel client --api-key KEY1 --local-endpoint http://localhost:3000
+     
+     # Terminal 2  
+     python -m terratunnel client --api-key KEY2 --local-endpoint http://localhost:4000
+     ```

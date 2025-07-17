@@ -258,10 +258,15 @@ async def github_oauth_callback(
     if external_redirect_uri:
         # This is from the OAuth proxy - create tunnel and redirect back with all data
         try:
+            # Check if user is admin
+            from .config import Config
+            is_admin = Config.is_admin_user("github", user["provider_username"])
+            
             # Create API key for the user
             api_key = db.create_api_key(
                 user_id=user_id,
-                name=f"Terrateam Setup Wizard - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                name=f"Terrateam Setup Wizard - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                is_admin=is_admin
             )
             
             # Get user's tunnel information

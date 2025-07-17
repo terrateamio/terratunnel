@@ -332,8 +332,12 @@ class Database:
     
     # API key management methods
     def create_api_key(self, user_id: int, name: Optional[str] = None, 
-                      expires_at: Optional[datetime] = None, scopes: str = "tunnel:create") -> str:
-        """Create a new API key for a user and return the raw key (replaces any existing key)"""
+                      expires_at: Optional[datetime] = None, scopes: str = "tunnel:create", is_admin: bool = False) -> str:
+        """Create a new API key for a user and return the raw key
+        
+        For regular users: replaces any existing key
+        For admin users: allows multiple active keys
+        """
         # Generate a secure random API key
         raw_key = secrets.token_urlsafe(32)
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
@@ -343,12 +347,13 @@ class Database:
         cursor = conn.cursor()
         
         try:
-            # First, deactivate any existing API keys for this user
-            cursor.execute("""
-                UPDATE api_keys 
-                SET is_active = 0
-                WHERE user_id = ? AND is_active = 1
-            """, (user_id,))
+            # Only deactivate existing keys for non-admin users
+            if not is_admin:
+                cursor.execute("""
+                    UPDATE api_keys 
+                    SET is_active = 0
+                    WHERE user_id = ? AND is_active = 1
+                """, (user_id,))
             
             # Now create the new API key
             cursor.execute("""
@@ -357,7 +362,10 @@ class Database:
             """, (user_id, key_hash, key_prefix, name, expires_at, scopes))
             
             conn.commit()
-            logger.info(f"     Created API key for user {user_id}: {key_prefix}... (replaced existing keys)")
+            if is_admin:
+                logger.info(f"     Created API key for admin user {user_id}: {key_prefix}... (keeping existing keys active)")
+            else:
+                logger.info(f"     Created API key for user {user_id}: {key_prefix}... (replaced existing keys)")
             return raw_key
         except Exception as e:
             logger.error(f"     Failed to create API key: {e}")

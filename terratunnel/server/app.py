@@ -661,9 +661,6 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=1008, reason="Missing local_endpoint")
             return
         
-        # Check if client requested a specific subdomain
-        requested_subdomain = client_info.get("subdomain")
-        
         # Authenticate using middleware
         if auth_middleware:
             auth_result = await auth_middleware.authenticate_websocket(websocket, client_info)
@@ -673,55 +670,24 @@ async def websocket_endpoint(websocket: WebSocket):
             user_id, api_key_id, tunnel_subdomain = auth_result
             
             if user_id:
-                # Check user tunnel limit
-                if not auth_middleware.check_user_tunnel_limit(user_id, manager.active_connections):
-                    await websocket.close(code=1008, reason="Tunnel limit reached")
-                    return
-                
                 # Get user info for logging
                 user = db.get_user_by_id(user_id)
                 if user:
                     username = user['provider_username']
                     logger.info(f"     Authenticated tunnel creation for user: {username} (ID: {user_id})")
                     
-                # Check if admin user requested a specific subdomain
-                if requested_subdomain and is_admin_user(user):
-                    # Check if subdomain is already in use
-                    with manager.lock:
-                        if requested_subdomain in manager.active_connections:
-                            logger.warning(f"Admin user {username} requested subdomain {requested_subdomain} but it's already in use")
-                            await websocket.close(code=1008, reason="Requested subdomain is already in use")
-                            return
-                    
-                    # Admin users can use custom subdomains
-                    subdomain = requested_subdomain
-                    logger.info(f"Admin user {username} using custom subdomain: {subdomain}")
-                    # Strip port from domain for hostname lookup
-                    domain_without_port = manager.domain.split(':')[0]
-                    hostname = f"{subdomain}.{domain_without_port}"
-                elif requested_subdomain and not is_admin_user(user):
-                    # Non-admin users cannot specify subdomains
-                    logger.warning(f"Non-admin user {username} tried to use custom subdomain: {requested_subdomain}")
-                    await websocket.close(code=1008, reason="Custom subdomains are only available to admin users")
-                    return
-                elif tunnel_subdomain:
+                if tunnel_subdomain:
                     # Use the user's static subdomain
                     subdomain = tunnel_subdomain
                     # Strip port from domain for hostname lookup
                     domain_without_port = manager.domain.split(':')[0]
                     hostname = f"{subdomain}.{domain_without_port}"
                 else:
-                    # Admin users without a tunnel_subdomain can get a new one
-                    if is_admin_user(user):
-                        subdomain = manager.generate_subdomain()
-                        domain_without_port = manager.domain.split(':')[0]
-                        hostname = f"{subdomain}.{domain_without_port}"
-                        logger.info(f"Admin user {username} generated new subdomain: {subdomain}")
-                    else:
-                        # This shouldn't happen if the database migration worked correctly
-                        logger.error(f"User {user_id} has no tunnel_subdomain assigned")
-                        await websocket.close(code=1008, reason="No tunnel subdomain assigned")
-                        return
+                    # Generate a new subdomain
+                    subdomain = manager.generate_subdomain()
+                    domain_without_port = manager.domain.split(':')[0]
+                    hostname = f"{subdomain}.{domain_without_port}"
+                    logger.info(f"User {username} generated new subdomain: {subdomain}")
             else:
                 # No authentication - generate random subdomain
                 subdomain = manager.generate_subdomain()
@@ -1041,22 +1007,39 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                 </div>
                 
                 <div class="card">
-                    <h1>API Key</h1>
-                    <p>Use your API key to connect the tunnel client. You can have one active API key at a time.</p>
+                    <h1>API Keys</h1>
+                    <p>Use your API key to connect the tunnel client. """ + ("As an admin, you can have multiple active API keys." if is_admin else "You can have one active API key at a time.") + """</p>
                     
                     <div class="api-keys">
         """
         
-        # Find the active API key (should only be one)
-        active_key = None
+        # Find active API keys
         if api_keys:
             active_keys = [key for key in api_keys if key.get('is_active', 1)]
-            if active_keys:
+            
+            if is_admin and active_keys:
+                # Show all active keys for admin users
+                for key in active_keys:
+                    created_date = key['created_at'].split('T')[0] if 'T' in key['created_at'] else key['created_at'].split()[0]
+                    html += f"""
+                        <div class="api-key">
+                            <div class="api-key-info">
+                                <div class="api-key-prefix">{key['key_prefix']}...</div>
+                                <div class="api-key-name">{key['name'] or 'API Key'}</div>
+                                <div class="api-key-created">Created on {created_date}</div>
+                            </div>
+                        </div>
+                    """
+                html += f"""
+                    <div style="margin-top: 20px;">
+                        <a href="/api/keys/new" class="button">Generate New API Key</a>
+                    </div>
+                """
+            elif active_keys:
+                # Show single key for regular users
                 active_key = active_keys[0]
-        
-        if active_key:
-            created_date = active_key['created_at'].split('T')[0] if 'T' in active_key['created_at'] else active_key['created_at'].split()[0]
-            html += f"""
+                created_date = active_key['created_at'].split('T')[0] if 'T' in active_key['created_at'] else active_key['created_at'].split()[0]
+                html += f"""
                         <div class="api-key">
                             <div class="api-key-info">
                                 <div class="api-key-prefix">{active_key['key_prefix']}...</div>
@@ -1065,7 +1048,14 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                             </div>
                             <a href="/api/keys/new" class="button">Rotate API Key</a>
                         </div>
-            """
+                """
+            else:
+                html += """
+                        <div class="empty">
+                            <p>You don't have an API key yet.</p>
+                            <a href="/api/keys/new" class="button">Generate API Key</a>
+                        </div>
+                """
         else:
             html += """
                         <div class="empty">
@@ -1079,29 +1069,27 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                 </div>
         """
         
-        # Add multiple tunnels section for admin users
+        # Add multiple API keys section for admin users
         if is_admin:
             html += """
                 <div class="card">
                     <h1>🚀 Multiple Tunnels (Admin Feature)</h1>
-                    <p>As an administrator, you can create multiple tunnels by specifying custom subdomains when connecting.</p>
+                    <p>As an administrator, you can create multiple API keys to run multiple tunnels simultaneously.</p>
                     
                     <h3>Create Additional Tunnels</h3>
-                    <p>Use the <code>--subdomain</code> flag to create custom tunnels:</p>
-                    <div class="code-block">python -m terratunnel client \\
-    --subdomain my-custom-tunnel \\
-    --local-endpoint http://localhost:3000</div>
+                    <p>Unlike regular users, admin users can have multiple active API keys. Each API key can be used to create a separate tunnel:</p>
+                    <div class="code-block"># Generate a new API key from the dashboard above
+# Then use it to create a new tunnel:
+python -m terratunnel client \\
+    --api-key YOUR_NEW_API_KEY \\
+    --local-endpoint http://localhost:3000
+
+# Run another tunnel with a different API key:
+python -m terratunnel client \\
+    --api-key ANOTHER_API_KEY \\
+    --local-endpoint http://localhost:4000</div>
                     
-                    <p>This will create a tunnel at: <code>https://my-custom-tunnel.""" + manager.domain + """</code></p>
-                    
-                    <h3>Examples</h3>
-                    <ul style="line-height: 1.8;">
-                        <li>Development API: <code>--subdomain dev-api</code></li>
-                        <li>Staging Environment: <code>--subdomain staging-app</code></li>
-                        <li>Testing Webhook: <code>--subdomain test-webhook</code></li>
-                    </ul>
-                    
-                    <p style="margin-top: 20px;"><strong>Note:</strong> Each subdomain must be unique. If a subdomain is already in use, the connection will be rejected.</p>
+                    <p style="margin-top: 20px;"><strong>Note:</strong> Each API key will create a tunnel with its own unique subdomain.</p>
                 </div>
         """
         
@@ -1561,7 +1549,11 @@ async def generate_api_key(request: Request, auth_token: Optional[str] = Cookie(
     
     # Generate API key
     if db:
-        api_key = db.create_api_key(user["id"], api_key_name)
+        # Check if user is admin
+        user_details = db.get_user_by_id(user["id"])
+        is_admin = is_admin_user(user_details) if user_details else False
+        
+        api_key = db.create_api_key(user["id"], api_key_name, is_admin=is_admin)
         key_prefix = api_key[:8]  # Extract prefix for display
         
         # Show the API key (only time it will be shown in full)

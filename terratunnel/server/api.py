@@ -116,6 +116,11 @@ async def exchange_github_token(request: TokenExchangeRequest):
             avatar_url=github_user.get("avatar_url")
         )
         
+        # Get user info to check if admin
+        user = db.get_user_by_id(user_id)
+        from .config import Config
+        is_admin = Config.is_admin_user(user["auth_provider"], user["provider_username"]) if user else False
+        
         # Create API key for the user
         api_key_name = request.api_key_name or f"API key created {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
         
@@ -124,7 +129,8 @@ async def exchange_github_token(request: TokenExchangeRequest):
             user_id=user_id,
             name=api_key_name,
             expires_at=None,  # No expiration
-            scopes="tunnel:create,tunnel:read,tunnel:delete"
+            scopes="tunnel:create,tunnel:read,tunnel:delete",
+            is_admin=is_admin
         )
         
         # Get the key prefix (first 8 characters)

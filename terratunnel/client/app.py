@@ -96,8 +96,6 @@ class TunnelClient:
             }
             
             # Add subdomain if specified (for admin users)
-            if hasattr(self, 'requested_subdomain') and self.requested_subdomain:
-                endpoint_info["subdomain"] = self.requested_subdomain
             
             async with self.websocket_send_lock:
                 await self.websocket.send(json.dumps(endpoint_info))
@@ -1357,12 +1355,10 @@ class TunnelClient:
         '''
 
 
-async def main_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False, api_key: Optional[str] = None, subdomain: Optional[str] = None):
+async def main_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False, api_key: Optional[str] = None):
     logger.info(f"Starting tunnel client - local endpoint: {local_endpoint}")
     
     client = TunnelClient(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key)
-    if subdomain:
-        client.requested_subdomain = subdomain
     servers = []
     server_tasks = []
     
@@ -1488,9 +1484,9 @@ async def main_client(server_url: str, local_endpoint: str, dashboard: bool = Fa
                 pass
 
 
-def run_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False, api_key: Optional[str] = None, subdomain: Optional[str] = None):
+def run_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False, api_key: Optional[str] = None):
     try:
-        asyncio.run(main_client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key, subdomain))
+        asyncio.run(main_client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key))
     except KeyboardInterrupt:
         logger.info("Stopping tunnel client...")
     except Exception as e:

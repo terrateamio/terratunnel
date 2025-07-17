@@ -47,11 +47,9 @@ def server(host, port, domain, db_path):
               help="Automatically update GitHub App webhook URL when tunnel connects (env: TERRATUNNEL_UPDATE_GITHUB_WEBHOOK)")
 @click.option("--api-key", envvar="TERRATUNNEL_API_KEY",
               help="API key for authentication (env: TERRATUNNEL_API_KEY)")
-@click.option("--subdomain", envvar="TERRATUNNEL_SUBDOMAIN",
-              help="Request specific subdomain (admin users only, env: TERRATUNNEL_SUBDOMAIN)")
-def client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key, subdomain):
+def client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key):
     """Connect to a tunnel server and forward requests to a local endpoint."""
-    run_client(server_url=server_url, local_endpoint=local_endpoint, dashboard=dashboard, dashboard_port=dashboard_port, api_port=api_port, update_github_webhook=update_github_webhook, api_key=api_key, subdomain=subdomain)
+    run_client(server_url=server_url, local_endpoint=local_endpoint, dashboard=dashboard, dashboard_port=dashboard_port, api_port=api_port, update_github_webhook=update_github_webhook, api_key=api_key)
 
 
 if __name__ == "__main__":
