@@ -239,6 +239,10 @@ TERRATUNNEL_GITHUB_ADMIN_USERS=username1,username2
 
 # Database (for Fly.io deployment)
 TERRATUNNEL_DB_PATH=/data/terratunnel.db
+
+# Request logging (optional - disabled by default)
+# Set this to enable detailed request/response logging to a file
+# TERRATUNNEL_REQUEST_LOG=./terratunnel_requests.log
 ```
 
 ### Common Issues and Solutions
@@ -307,3 +311,11 @@ TERRATUNNEL_DB_PATH=/data/terratunnel.db
 4. **Middleware-Based Routing**: Subdomain detection moved to middleware for cleaner request handling.
 
 5. **Database Schema Updates**: Added `tunnel_subdomain` column to users table with automatic migration support.
+
+6. **Request Logging System**: 
+   - Access logs always shown in console: `[timestamp] METHOD /path -> status_code duration_ms`
+   - Optional detailed logging to file (disabled by default)
+   - When enabled via `TERRATUNNEL_REQUEST_LOG` environment variable:
+     - Adds request UUID to console logs
+     - Saves full request/response details to specified log file
+     - Human-readable format with clear section separators
