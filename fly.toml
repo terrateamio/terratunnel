@@ -19,7 +19,7 @@ primary_region = 'iad'
   TERRATUNNEL_LOG_LEVEL = 'DEBUG'
   JWT_ALGORITHM = 'HS256'
   JWT_EXPIRATION_HOURS = '24'
-  TERRATUNNEL_GITHUB_ADMIN_USERS = 'joshpollara'
+  TERRATUNNEL_GITHUB_ADMIN_USERS = 'joshpollara,orbitz'
   TERRATUNNEL_DB_PATH = '/data/terratunnel.db'
 
 [http_service]

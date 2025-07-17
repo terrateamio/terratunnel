@@ -1065,41 +1065,41 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         # Add admin section if user is admin
         if is_admin:
             # Gather tunnel data for admin view
-            tunnels = []
+            active_tunnels = []
             with manager.lock:
                 for hostname, subdomain in manager.hostname_to_subdomain.items():
                     endpoint = manager.subdomain_to_endpoint.get(subdomain)
                     websocket = manager.active_connections.get(subdomain)
-                    tunnels.append({
+                    
+                    # Get tunnel info from database to find owner
+                    tunnel_info = None
+                    if db:
+                        tunnel_info = db.get_tunnel_by_subdomain(subdomain)
+                    
+                    active_tunnels.append({
                         "hostname": hostname,
                         "subdomain": subdomain, 
                         "endpoint": endpoint,
                         "connected": websocket is not None,
-                        "url": f"https://{hostname}"
+                        "url": f"https://{hostname}",
+                        "owner": tunnel_info.get("provider_username") if tunnel_info else "Unknown"
                     })
             
             # Sort by hostname
-            tunnels.sort(key=lambda x: x["hostname"])
-            
-            # Get recent audit logs
-            recent_logs = []
-            if db:
-                try:
-                    recent_logs = db.get_audit_logs(limit=10)
-                except:
-                    pass
+            active_tunnels.sort(key=lambda x: x["hostname"])
             
             html += f"""
                 <div class="card">
                     <h1>🛡️ Admin Dashboard</h1>
                     <p>You have administrator privileges. Here's an overview of all active tunnels.</p>
                     
-                    <h2>Active Tunnels ({len([t for t in tunnels if t['connected']])})</h2>
+                    <h2>Active Tunnels ({len([t for t in active_tunnels if t['connected']])})</h2>
                     <div style="overflow-x: auto;">
                         <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
                             <thead>
                                 <tr>
                                     <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Hostname</th>
+                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Owner</th>
                                     <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Endpoint</th>
                                     <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Status</th>
                                 </tr>
@@ -1107,7 +1107,7 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                             <tbody>
             """
             
-            for tunnel in tunnels:
+            for tunnel in active_tunnels:
                 if tunnel['connected']:
                     status_badge = '<span style="color: #28a745;">● Connected</span>'
                     html += f"""
@@ -1116,6 +1116,9 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                                         <a href="{tunnel['url']}" target="_blank" style="color: #0066cc; text-decoration: none;">
                                             {tunnel['hostname']}
                                         </a>
+                                    </td>
+                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8;">
+                                        {tunnel['owner']}
                                     </td>
                                     <td style="padding: 12px; border-bottom: 1px solid #e1e4e8; font-family: monospace; font-size: 13px;">
                                         {tunnel['endpoint'] or '-'}
@@ -1126,70 +1129,11 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                                 </tr>
                     """
             
-            if not any(t['connected'] for t in tunnels):
-                html += """
-                                <tr>
-                                    <td colspan="3" style="padding: 20px; text-align: center; color: #666;">
-                                        No active tunnels
-                                    </td>
-                                </tr>
-                """
-            
-            html += """
-                            </tbody>
-                        </table>
-                    </div>
-                    
-                    <h2 style="margin-top: 30px;">Recent Connections</h2>
-                    <div style="overflow-x: auto;">
-                        <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
-                            <thead>
-                                <tr>
-                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">User</th>
-                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Subdomain</th>
-                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Connected</th>
-                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Duration</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-            """
-            
-            for log in recent_logs[:10]:
-                connected_at = log.get('connected_at', '')
-                disconnected_at = log.get('disconnected_at', '')
-                duration = '-'
-                if connected_at and disconnected_at:
-                    try:
-                        from datetime import datetime
-                        start = datetime.fromisoformat(connected_at.replace(' ', 'T'))
-                        end = datetime.fromisoformat(disconnected_at.replace(' ', 'T'))
-                        delta = end - start
-                        duration = str(delta).split('.')[0]  # Remove microseconds
-                    except:
-                        pass
-                
-                html += f"""
-                                <tr>
-                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8;">
-                                        {log.get('username', 'Unknown')}
-                                    </td>
-                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8; font-family: monospace; font-size: 13px;">
-                                        {log.get('subdomain', '-')}
-                                    </td>
-                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8; color: #666; font-size: 13px;">
-                                        {connected_at}
-                                    </td>
-                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8;">
-                                        {duration}
-                                    </td>
-                                </tr>
-                """
-            
-            if not recent_logs:
+            if not any(t['connected'] for t in active_tunnels):
                 html += """
                                 <tr>
                                     <td colspan="4" style="padding: 20px; text-align: center; color: #666;">
-                                        No recent connections
+                                        No active tunnels
                                     </td>
                                 </tr>
                 """
@@ -1341,8 +1285,7 @@ async def new_tunnel_page(request: Request, auth_token: Optional[str] = Cookie(N
         return RedirectResponse(url="/auth/github?redirect_uri=/tunnels/new", status_code=302)
     
     # Check if user is admin
-    user_details = db.get_user_by_id(user["id"]) if db else None
-    if not user_details or not is_admin_user(user_details):
+    if not is_admin_user(user):
         return HTMLResponse("""
         <h1>Access Denied</h1>
         <p>Only administrators can create new tunnels.</p>
@@ -1351,7 +1294,7 @@ async def new_tunnel_page(request: Request, auth_token: Optional[str] = Cookie(N
     
     # Check tunnel limit for non-admin users (though this shouldn't happen)
     tunnels = db.list_user_tunnels(user["id"]) if db else []
-    if not is_admin_user(user_details) and len(tunnels) >= 1:
+    if not is_admin_user(user) and len(tunnels) >= 1:
         return HTMLResponse("""
         <h1>Tunnel Limit Reached</h1>
         <p>You already have a tunnel. Non-admin users are limited to one tunnel.</p>
@@ -1399,8 +1342,7 @@ async def create_tunnel(request: Request, auth_token: Optional[str] = Cookie(Non
         return RedirectResponse(url="/auth/github", status_code=302)
     
     # Check if user is admin
-    user_details = db.get_user_by_id(user["id"]) if db else None
-    if not user_details or not is_admin_user(user_details):
+    if not is_admin_user(user):
         raise HTTPException(status_code=403, detail="Only administrators can create new tunnels")
     
     # Get form data
@@ -1724,8 +1666,7 @@ async def generate_api_key(request: Request, auth_token: Optional[str] = Cookie(
     # Generate API key
     if db:
         # Check if user is admin
-        user_details = db.get_user_by_id(user["id"])
-        is_admin = is_admin_user(user_details) if user_details else False
+        is_admin = is_admin_user(user)
         
         api_key = db.create_api_key(user["id"], api_key_name, is_admin=is_admin)
         key_prefix = api_key[:8]  # Extract prefix for display
