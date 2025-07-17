@@ -22,17 +22,29 @@ security = HTTPBearer()
 
 # Global database instance (set by app.py)
 _db: Optional[Database] = None
+_domain: Optional[str] = None
 
 def set_database(db: Database):
     """Set the global database instance"""
     global _db
     _db = db
 
+def set_domain(domain: str):
+    """Set the global domain"""
+    global _domain
+    _domain = domain
+
 def get_database() -> Database:
     """Get the global database instance"""
     if _db is None:
         raise RuntimeError("Database not initialized")
     return _db
+
+def get_domain() -> str:
+    """Get the global domain"""
+    if _domain is None:
+        return "tunnel.terrateam.dev"  # Default fallback
+    return _domain
 
 
 # Request/Response models
@@ -47,6 +59,7 @@ class TokenExchangeResponse(BaseModel):
     user_id: int = Field(..., description="User ID in Terratunnel")
     username: str = Field(..., description="GitHub username")
     expires_at: Optional[datetime] = Field(None, description="API key expiration time (null if no expiration)")
+    tunnel_url: str = Field(..., description="Full tunnel URL for this API key")
 
 
 class APIKeyInfo(BaseModel):
@@ -141,12 +154,23 @@ async def exchange_github_token(request: TokenExchangeRequest):
         # Get the key prefix (first 8 characters)
         api_key_prefix = api_key[:8]
         
+        # Get the tunnel subdomain for this user
+        # The create_api_key method creates a tunnel if one doesn't exist
+        tunnels = db.list_user_tunnels(user_id)
+        if not tunnels:
+            raise HTTPException(status_code=500, detail="Failed to create tunnel")
+        
+        tunnel_subdomain = tunnels[0]["subdomain"]
+        domain = get_domain()
+        tunnel_url = f"{tunnel_subdomain}.{domain}"
+        
         return TokenExchangeResponse(
             api_key=api_key,
             api_key_prefix=api_key_prefix,
             user_id=user_id,
             username=github_user["login"],
-            expires_at=None
+            expires_at=None,
+            tunnel_url=tunnel_url
         )
         
     except Exception as e:

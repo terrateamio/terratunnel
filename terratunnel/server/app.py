@@ -17,7 +17,7 @@ from coolname import generate_slug
 from .database import Database
 from .config import Config
 from .auth import auth_router, require_admin_user, get_current_user_from_cookie, set_database as set_auth_database
-from .api import api_router, set_database as set_api_database
+from .api import api_router, set_database as set_api_database, set_domain as set_api_domain
 from .middleware import AuthMiddleware
 from ..utils import is_binary_content
 from ..streaming import StreamReceiver, StreamMetadata
@@ -2519,6 +2519,7 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, domain: str = "tunnel.te
     # Set database in auth and api modules
     set_auth_database(db)
     set_api_database(db)
+    set_api_domain(domain)
     
     # Log OAuth configuration status
     if Config.has_github_oauth():
