@@ -18,9 +18,13 @@ class RequestLogger:
         """Initialize the request logger.
         
         Args:
-            log_file: Path to the request log file. Defaults to ./terratunnel_requests.log
+            log_file: Path to the request log file. If not provided, checks TERRATUNNEL_REQUEST_LOG env var.
         """
-        self.log_file = Path(log_file or os.getenv("TERRATUNNEL_REQUEST_LOG", "./terratunnel_requests.log"))
+        log_path = log_file or os.getenv("TERRATUNNEL_REQUEST_LOG")
+        if not log_path:
+            raise ValueError("Request logger requires a log file path")
+            
+        self.log_file = Path(log_path)
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         

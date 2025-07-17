@@ -49,8 +49,9 @@ class TunnelClient:
         self.max_reconnect_delay = 60  # Maximum reconnect delay
         self.reconnect_attempts = 0
         
-        # Initialize request logger
-        self.request_logger = RequestLogger()
+        # Initialize request logger (only if enabled)
+        log_file = os.getenv("TERRATUNNEL_REQUEST_LOG")
+        self.request_logger = RequestLogger() if log_file else None
         
         parsed = urlparse(server_url)
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
@@ -176,21 +177,37 @@ class TunnelClient:
                 self.webhook_history.pop()  # Remove oldest
 
     def _log_request(self, request_data: dict, response_data: dict, duration_ms: Optional[float] = None):
-        """Log request to file and display concise access log to console.
+        """Log request to file (if enabled) and display access log to console.
         
         Args:
             request_data: Request details
             response_data: Response details  
             duration_ms: Request duration in milliseconds (optional)
         """
-        # Log full details to file and get request ID
-        request_id = self.request_logger.log_request(request_data, response_data)
+        method = request_data.get("method", "GET")
+        path = request_data.get("path", "/")
+        status_code = response_data.get("status_code", 0)
         
-        # Display concise access log to console
-        access_log = self.request_logger.format_access_log(
-            request_data, response_data, request_id, duration_ms
-        )
-        logger.info(access_log)
+        # Add query string if present
+        query_params = request_data.get("query_params", {})
+        if query_params:
+            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+            path += query_str
+        
+        if self.request_logger:
+            # Log full details to file and get request ID
+            request_id = self.request_logger.log_request(request_data, response_data)
+            
+            # Display concise access log to console with request ID
+            access_log = self.request_logger.format_access_log(
+                request_data, response_data, request_id, duration_ms
+            )
+            logger.info(access_log)
+        else:
+            # Simple access log without request ID when logging is disabled
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            duration_str = f" {duration_ms:.0f}ms" if duration_ms is not None else ""
+            logger.info(f"[{timestamp}] {method} {path} -> {status_code}{duration_str}")
 
     def _is_binary_content(self, content_type: str) -> bool:
         """Determine if content type indicates binary data."""
