@@ -159,7 +159,14 @@ async def subdomain_proxy_middleware(request: Request, call_next):
                 path = path[1:]  # Remove leading slash for consistency
             
             # Call the proxy handler directly
-            return await proxy_request(request, path)
+            try:
+                return await proxy_request(request, path)
+            except HTTPException as e:
+                # Convert HTTPException to Response in middleware context
+                return JSONResponse(
+                    status_code=e.status_code,
+                    content={"detail": e.detail}
+                )
         else:
             # Subdomain doesn't exist - return error page
             error_html = f"""
