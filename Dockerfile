@@ -41,7 +41,7 @@ RUN addgroup -S terratunnel && adduser -S terratunnel -G terratunnel
 RUN mkdir -p /data && chown terratunnel:terratunnel /data
 
 # Install runtime dependencies only
-RUN apk add --no-cache libffi
+RUN apk add --no-cache libffi libmagic
 
 # Copy installed packages and application code from builder
 COPY --from=builder /install /usr/local/lib/python3.11/site-packages
