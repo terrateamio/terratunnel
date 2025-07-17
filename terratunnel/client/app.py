@@ -7,6 +7,7 @@ import sys
 import os
 import time
 import base64
+import uuid
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 from urllib.parse import urlparse
@@ -19,6 +20,10 @@ import jwt
 
 from .request_logger import RequestLogger
 from ..utils import is_binary_content
+from ..streaming import (
+    ChunkedStreamer, StreamMessage, StreamMetadata, 
+    STREAMING_THRESHOLD, DEFAULT_CHUNK_SIZE
+)
 
 # Suppress uvicorn's shutdown errors
 logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
@@ -37,6 +42,7 @@ class TunnelClient:
         self.websocket = None
         self.running = True
         self.lock = threading.Lock()
+        self.websocket_send_lock = asyncio.Lock()  # Lock for WebSocket sends
         self.dashboard = dashboard
         self.dashboard_port = dashboard_port
         self.api_port = api_port
@@ -79,7 +85,8 @@ class TunnelClient:
                 extra_headers=headers,
                 ping_interval=10,  # Send ping every 10 seconds
                 ping_timeout=20,   # Wait 20 seconds for pong
-                close_timeout=10   # Wait 10 seconds for close handshake
+                close_timeout=10,  # Wait 10 seconds for close handshake
+                max_size=512 * 1024 * 1024  # 512MB max message size
             )
             
             # Send local endpoint information to server
@@ -88,7 +95,8 @@ class TunnelClient:
                 "local_endpoint": self.local_endpoint
             }
             
-            await self.websocket.send(json.dumps(endpoint_info))
+            async with self.websocket_send_lock:
+                await self.websocket.send(json.dumps(endpoint_info))
             
             # Wait for hostname assignment with timeout
             try:
@@ -177,6 +185,142 @@ class TunnelClient:
             if len(self.webhook_history) > self.max_history:
                 self.webhook_history.pop()  # Remove oldest
 
+    async def _process_request(self, request_data: dict):
+        """Process a request asynchronously to avoid blocking other requests."""
+        request_id = request_data.get("request_id", "unknown")
+        method = request_data.get("method", "GET")
+        path = request_data.get("path", "/")
+        
+        logger.debug(f"[{request_id}] Starting to process {method} {path}")
+        
+        try:
+            # Handle HTTP request and track duration
+            start_time = time.time()
+            logger.debug(f"[{request_id}] Calling handle_request")
+            response_data = await self.handle_request(request_data)
+            duration_ms = (time.time() - start_time) * 1000
+            
+            logger.debug(f"[{request_id}] Request completed in {duration_ms:.0f}ms, status: {response_data.get('status_code')}")
+            
+            # Log request with duration
+            self._log_request(request_data, response_data, duration_ms)
+            
+            # Include request_id in response if present
+            if request_data.get("request_id"):
+                response_data["request_id"] = request_data["request_id"]
+            
+            # Check if response needs streaming
+            if response_data.get("is_streaming"):
+                logger.debug(f"[CLIENT-PROCESS] Response marked for streaming")
+                logger.debug(f"[CLIENT-PROCESS] Stream info: {response_data.get('stream')}")
+                
+                # Remove the response object before sending
+                streaming_response = response_data.pop("_streaming_response", None)
+                logger.debug(f"[CLIENT-PROCESS] Removed streaming response object: {type(streaming_response)}")
+                
+                # First send the initial response with streaming info
+                if self.websocket:
+                    logger.debug(f"[{request_id}] Sending initial streaming response via WebSocket")
+                    logger.debug(f"[CLIENT-PROCESS] Initial response keys: {list(response_data.keys())}")
+                    logger.debug(f"[CLIENT-PROCESS] Initial response is_streaming: {response_data.get('is_streaming')}")
+                    async with self.websocket_send_lock:
+                        await self.websocket.send(json.dumps(response_data))
+                    logger.debug(f"[{request_id}] Initial streaming response sent")
+                
+                # Put the response back for streaming
+                if streaming_response:
+                    response_data["_streaming_response"] = streaming_response
+                    logger.debug(f"[CLIENT-PROCESS] Restored streaming response for content streaming")
+                
+                # Now stream the actual content
+                await self._stream_response_content(request_id, response_data)
+            else:
+                # Send response back through WebSocket
+                if self.websocket:
+                    logger.debug(f"[{request_id}] Sending response back via WebSocket")
+                    async with self.websocket_send_lock:
+                        await self.websocket.send(json.dumps(response_data))
+                    logger.debug(f"[{request_id}] Response sent successfully")
+                
+        except Exception as e:
+            logger.error(f"Error processing request: {e}")
+            # Send error response if possible
+            if self.websocket and request_data.get("request_id"):
+                error_response = {
+                    "request_id": request_data["request_id"],
+                    "status_code": 500,
+                    "headers": {"content-type": "text/plain"},
+                    "body": f"Internal error: {str(e)}"
+                }
+                try:
+                    async with self.websocket_send_lock:
+                        await self.websocket.send(json.dumps(error_response))
+                except Exception:
+                    pass
+
+    async def _stream_response_content(self, request_id: str, response_data: dict):
+        """Stream large response content in chunks."""
+        stream_info = response_data.get("stream", {})
+        stream_id = stream_info.get("id")
+        response = response_data.get("_streaming_response")
+        
+        logger.debug(f"[CLIENT-STREAM] Starting _stream_response_content for request {request_id}")
+        logger.debug(f"[CLIENT-STREAM] Stream info: {stream_info}")
+        
+        if not response:
+            logger.error(f"[CLIENT-STREAM] No response object found for streaming")
+            return
+        
+        content_size = stream_info.get("total_size", 0)
+        
+        try:
+            logger.info(f"[CLIENT-STREAM] Starting to stream {content_size} bytes for stream {stream_id}")
+            logger.debug(f"[CLIENT-STREAM] Response content type: {type(response.content)}, size: {len(response.content)}")
+            logger.debug(f"[CLIENT-STREAM] First 100 bytes of content: {response.content[:100]!r}")
+            
+            # Create streamer
+            streamer = ChunkedStreamer(chunk_size=DEFAULT_CHUNK_SIZE)
+            
+            # Stream the response content
+            chunk_count = 0
+            async for chunk_message in streamer.stream_bytes(response.content, stream_id):
+                if self.websocket:
+                    message_type = chunk_message.get("type")
+                    logger.debug(f"[CLIENT-STREAM] Sending {message_type} message for stream {stream_id}")
+                    
+                    # Log the actual message being sent
+                    if message_type == "stream_chunk":
+                        chunk_info = chunk_message.get("chunk", {})
+                        logger.debug(f"[CLIENT-STREAM] Chunk message details: index={chunk_info.get('index')}, size={chunk_info.get('size')}, data_len={len(chunk_info.get('data', ''))}")
+                    
+                    message_json = json.dumps(chunk_message)
+                    logger.debug(f"[CLIENT-STREAM] Sending message (first 200 chars): {message_json[:200]}...")
+                    
+                    async with self.websocket_send_lock:
+                        await self.websocket.send(message_json)
+                    
+                    if message_type == "stream_chunk":
+                        chunk_count += 1
+                        chunk_info = chunk_message.get("chunk", {})
+                        logger.debug(f"[CLIENT-STREAM] Sent chunk {chunk_info.get('index') + 1}/{chunk_info.get('total')} (count={chunk_count})")
+                    elif message_type == "stream_complete":
+                        logger.info(f"[CLIENT-STREAM] Sent stream completion message with checksum: {chunk_message.get('checksum')}")
+            
+            logger.info(f"[CLIENT-STREAM] Streaming completed - sent {chunk_count} chunks")
+            
+        except Exception as e:
+            logger.error(f"[{request_id}] Error during streaming: {e}")
+            # Send error message
+            if self.websocket:
+                error_msg = StreamMessage.error(stream_id, str(e))
+                async with self.websocket_send_lock:
+                    await self.websocket.send(json.dumps(error_msg))
+        
+        finally:
+            # Clean up the response object from response_data
+            if "_streaming_response" in response_data:
+                del response_data["_streaming_response"]
+
     def _log_request(self, request_data: dict, response_data: dict, duration_ms: Optional[float] = None):
         """Log request to file (if enabled) and display access log to console.
         
@@ -212,6 +356,7 @@ class TunnelClient:
 
 
     async def handle_request(self, request_data: dict) -> dict:
+        request_id = request_data.get("request_id", "unknown")
         try:
             method = request_data.get("method", "GET")
             path = request_data.get("path", "/")
@@ -219,21 +364,27 @@ class TunnelClient:
             query_params = request_data.get("query_params", {})
             body = request_data.get("body", "")
             
+            logger.debug(f"[{request_id}] Processing {method} {path}")
+            
             # Handle binary request body if present
             if request_data.get("is_binary") and body:
+                logger.debug(f"[{request_id}] Decoding binary request body")
                 body = base64.b64decode(body)
             
             url = f"{self.local_url}{path}"
+            logger.debug(f"[{request_id}] Making request to {url}")
             
             async with httpx.AsyncClient() as client:
+                logger.debug(f"[{request_id}] Sending HTTP request...")
                 response = await client.request(
                     method=method,
                     url=url,
                     headers=headers,
                     params=query_params,
                     content=body,
-                    timeout=30.0  # 30 second timeout
+                    timeout=600.0  # 10 minutes for large files
                 )
+                logger.debug(f"[{request_id}] HTTP request completed, status: {response.status_code}")
                 
                 # Check if response is binary based on content-type
                 content_type = response.headers.get("content-type", "").lower()
@@ -244,11 +395,71 @@ class TunnelClient:
                     "headers": dict(response.headers),
                 }
                 
+                # Check response size before encoding
+                # Base64 encoding increases size by ~33%, so we need to account for that
+                # Plus JSON overhead and WebSocket framing
+                # Default: 50MB raw data (will be ~67MB encoded)
+                # This conservative limit prevents server OOM issues
+                MAX_RESPONSE_SIZE = int(os.environ.get('TERRATUNNEL_MAX_RESPONSE_SIZE', str(50 * 1024 * 1024)))
+                
                 if is_binary:
-                    # Encode binary data as base64
+                    # Check content length from headers first
+                    content_length = response.headers.get("content-length")
+                    if content_length:
+                        content_size = int(content_length)
+                    else:
+                        content_size = len(response.content)
+                    
+                    logger.debug(f"[{request_id}] Response is binary, size: {content_size} bytes")
+                    
+                    # Use streaming for large files
+                    if content_size > STREAMING_THRESHOLD:
+                        logger.info(f"[{request_id}] Large response ({content_size} bytes > {STREAMING_THRESHOLD} threshold), using streaming")
+                        
+                        stream_id = str(uuid.uuid4())
+                        logger.debug(f"[CLIENT-STREAM-INIT] Created stream ID: {stream_id}")
+                        logger.debug(f"[CLIENT-STREAM-INIT] Response object type: {type(response)}")
+                        logger.debug(f"[CLIENT-STREAM-INIT] Response content available: {hasattr(response, 'content')}")
+                        logger.debug(f"[CLIENT-STREAM-INIT] Content size from response.content: {len(response.content) if hasattr(response, 'content') else 'N/A'}")
+                        
+                        # Send initial response with streaming info
+                        response_data["body"] = ""
+                        response_data["is_binary"] = True
+                        response_data["is_streaming"] = True
+                        response_data["stream"] = {
+                            "id": stream_id,
+                            "total_size": content_size,
+                            "content_type": content_type
+                        }
+                        
+                        logger.debug(f"[CLIENT-STREAM-INIT] Set response_data streaming fields: is_streaming={response_data.get('is_streaming')}, stream={response_data.get('stream')}")
+                        
+                        # Return response data with streaming flag
+                        # The initial response will be sent by _process_request
+                        response_data["_streaming_response"] = response  # Store for later streaming
+                        logger.debug(f"[CLIENT-STREAM-INIT] Stored response object for later streaming")
+                        return response_data
+                    
+                    # For smaller files, use regular encoding
+                    logger.debug(f"[{request_id}] Encoding to base64...")
                     response_data["body"] = base64.b64encode(response.content).decode('ascii')
                     response_data["is_binary"] = True
+                    logger.debug(f"[{request_id}] Base64 encoding complete, size: {len(response_data['body'])} chars")
                 else:
+                    text_size = len(response.text.encode('utf-8'))
+                    logger.debug(f"[{request_id}] Response is text, size: {text_size} bytes")
+                    
+                    if text_size > MAX_RESPONSE_SIZE:
+                        logger.error(f"[{request_id}] Response too large: {text_size} bytes exceeds {MAX_RESPONSE_SIZE} bytes limit")
+                        size_mb = text_size / (1024 * 1024)
+                        max_mb = MAX_RESPONSE_SIZE / (1024 * 1024)
+                        return {
+                            "status_code": 413,
+                            "headers": {"content-type": "text/plain"},
+                            "body": f"Response too large: {size_mb:.1f}MB exceeds maximum allowed size of {max_mb:.1f}MB. Terratunnel currently does not support streaming large files.",
+                            "is_binary": False
+                        }
+                    
                     response_data["body"] = response.text
                     response_data["is_binary"] = False
                 
@@ -307,24 +518,17 @@ class TunnelClient:
                     request_data = json.loads(message)
                     
                     if request_data.get("type") == "keepalive":
-                        await self.websocket.send(json.dumps({"type": "keepalive_ack"}))
+                        async with self.websocket_send_lock:
+                            await self.websocket.send(json.dumps({"type": "keepalive_ack"}))
                         with self.lock:
                             self.last_keepalive = time.time()
                         continue
                     
-                    # Handle HTTP request and track duration
-                    start_time = time.time()
-                    response_data = await self.handle_request(request_data)
-                    duration_ms = (time.time() - start_time) * 1000
-                    
-                    # Log request with duration
-                    self._log_request(request_data, response_data, duration_ms)
-                    
-                    # Include request_id in response if present
-                    if request_data.get("request_id"):
-                        response_data["request_id"] = request_data["request_id"]
-                    
-                    await self.websocket.send(json.dumps(response_data))
+                    # Handle HTTP request concurrently
+                    request_id = request_data.get("request_id", "unknown")
+                    logger.debug(f"Received request {request_id} - {request_data.get('method')} {request_data.get('path')}")
+                    task = asyncio.create_task(self._process_request(request_data))
+                    logger.debug(f"Created async task for request {request_id}")
                     
                 except websockets.exceptions.ConnectionClosed:
                     logger.info("WebSocket connection closed")
