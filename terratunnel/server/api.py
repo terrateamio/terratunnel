@@ -1,13 +1,18 @@
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, Query, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import StreamingResponse
 import httpx
+import sqlite3
+import json
+import io
 
 from .database import Database
 from .config import Config
+from .auth import get_current_user_from_cookie
 
 # Create API router
 api_router = APIRouter(prefix="/api", tags=["api"])
@@ -184,4 +189,208 @@ async def revoke_api_key(key_id: int, api_key_info: dict = Depends(get_current_u
         return {"message": "API key revoked successfully"}
     else:
         raise HTTPException(status_code=404, detail="API key not found or not owned by user")
+
+
+# Admin Database Browser Endpoints
+async def require_admin_api(api_key_info: dict = Depends(get_current_user_from_api_key)) -> dict:
+    """Dependency to require admin user via API key"""
+    if not Config.is_admin_user(api_key_info["auth_provider"], api_key_info["provider_username"]):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return api_key_info
+
+
+@api_router.get("/admin/db/tables")
+async def list_database_tables(admin: dict = Depends(require_admin_api)):
+    """List all tables in the database"""
+    db = get_database()
+    conn = sqlite3.connect(db.db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            SELECT name, sql FROM sqlite_master 
+            WHERE type='table' AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+        """)
+        tables = []
+        for row in cursor.fetchall():
+            # Get table info
+            cursor.execute(f"PRAGMA table_info({row['name']})")
+            columns = [{"name": col[1], "type": col[2], "nullable": not col[3], "pk": col[5]} 
+                      for col in cursor.fetchall()]
+            
+            # Get row count
+            cursor.execute(f"SELECT COUNT(*) as count FROM {row['name']}")
+            row_count = cursor.fetchone()["count"]
+            
+            tables.append({
+                "name": row["name"],
+                "columns": columns,
+                "row_count": row_count,
+                "create_sql": row["sql"]
+            })
+        
+        return {"tables": tables}
+    finally:
+        conn.close()
+
+
+@api_router.get("/admin/db/tables/{table_name}")
+async def get_table_data(
+    table_name: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=1000),
+    admin: dict = Depends(require_admin_api)
+):
+    """Get paginated data from a specific table"""
+    db = get_database()
+    conn = sqlite3.connect(db.db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    try:
+        # Validate table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Table not found")
+        
+        # Get total count
+        cursor.execute(f"SELECT COUNT(*) as count FROM {table_name}")
+        total_count = cursor.fetchone()["count"]
+        
+        # Get paginated data
+        offset = (page - 1) * page_size
+        cursor.execute(f"SELECT * FROM {table_name} LIMIT ? OFFSET ?", (page_size, offset))
+        
+        rows = []
+        columns = []
+        for row in cursor.fetchall():
+            if not columns:
+                columns = list(row.keys())
+            rows.append(dict(row))
+        
+        # Convert datetime objects to ISO format strings
+        for row in rows:
+            for key, value in row.items():
+                if isinstance(value, datetime):
+                    row[key] = value.isoformat()
+        
+        return {
+            "table_name": table_name,
+            "columns": columns,
+            "rows": rows,
+            "total_count": total_count,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": (total_count + page_size - 1) // page_size
+        }
+    finally:
+        conn.close()
+
+
+@api_router.get("/admin/db/query")
+async def execute_query(
+    query: str = Query(..., description="SQL query to execute"),
+    admin: dict = Depends(require_admin_api)
+):
+    """Execute a custom SQL query (SELECT only for safety)"""
+    # Only allow SELECT queries for safety
+    if not query.strip().upper().startswith("SELECT"):
+        raise HTTPException(status_code=400, detail="Only SELECT queries are allowed")
+    
+    db = get_database()
+    conn = sqlite3.connect(db.db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(query)
+        rows = []
+        columns = []
+        for row in cursor.fetchall():
+            if not columns:
+                columns = list(row.keys())
+            row_dict = dict(row)
+            # Convert datetime objects to ISO format strings
+            for key, value in row_dict.items():
+                if isinstance(value, datetime):
+                    row_dict[key] = value.isoformat()
+            rows.append(row_dict)
+        
+        return {
+            "query": query,
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows)
+        }
+    except sqlite3.Error as e:
+        raise HTTPException(status_code=400, detail=f"Query error: {str(e)}")
+    finally:
+        conn.close()
+
+
+@api_router.get("/admin/db/download")
+async def download_database(admin: dict = Depends(require_admin_api)):
+    """Download the entire database file"""
+    db = get_database()
+    
+    # Read the database file
+    try:
+        with open(db.db_path, 'rb') as f:
+            db_content = f.read()
+        
+        # Return as downloadable file
+        return StreamingResponse(
+            io.BytesIO(db_content),
+            media_type="application/x-sqlite3",
+            headers={
+                "Content-Disposition": f"attachment; filename=terratunnel_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read database: {str(e)}")
+
+
+# JWT-based admin endpoints (for web UI)
+async def require_admin_jwt(request: Request) -> dict:
+    """Dependency to require admin user via JWT cookie"""
+    user = await get_current_user_from_cookie(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not Config.is_admin_user(user["provider"], user["username"]):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+@api_router.get("/admin/db/tables", dependencies=[Depends(require_admin_jwt)])
+async def list_database_tables_jwt(request: Request):
+    """List all tables in the database (JWT auth)"""
+    return await list_database_tables(admin=await require_admin_jwt(request))
+
+
+@api_router.get("/admin/db/tables/{table_name}", dependencies=[Depends(require_admin_jwt)])
+async def get_table_data_jwt(
+    table_name: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=1000),
+    request: Request = None
+):
+    """Get paginated data from a specific table (JWT auth)"""
+    return await get_table_data(table_name, page, page_size, admin=await require_admin_jwt(request))
+
+
+@api_router.get("/admin/db/query", dependencies=[Depends(require_admin_jwt)])
+async def execute_query_jwt(
+    query: str = Query(..., description="SQL query to execute"),
+    request: Request = None
+):
+    """Execute a custom SQL query (JWT auth)"""
+    return await execute_query(query, admin=await require_admin_jwt(request))
+
+
+@api_router.get("/admin/db/download", dependencies=[Depends(require_admin_jwt)])
+async def download_database_jwt(request: Request):
+    """Download the entire database file (JWT auth)"""
+    return await download_database(admin=await require_admin_jwt(request))
 
