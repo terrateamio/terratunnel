@@ -19,6 +19,7 @@ from .config import Config
 from .auth import auth_router, require_admin_user, set_database as set_auth_database
 from .api import api_router, set_database as set_api_database
 from .middleware import AuthMiddleware
+from ..utils import is_binary_content
 
 
 logger = logging.getLogger("terratunnel-server")
@@ -1504,26 +1505,6 @@ async def admin_api_audit(request: Request, current_user = Depends(require_admin
     }
 
 
-def _is_binary_content(content_type: str) -> bool:
-    """Determine if content type indicates binary data."""
-    # Common binary content types
-    binary_types = [
-        'image/', 'audio/', 'video/', 'application/pdf',
-        'application/zip', 'application/x-zip', 'application/x-zip-compressed',
-        'application/octet-stream', 'application/x-tar', 'application/x-gzip',
-        'application/x-bzip2', 'application/x-7z-compressed',
-        'application/vnd.ms-excel', 'application/vnd.openxmlformats',
-        'application/msword', 'application/vnd.ms-powerpoint',
-        'application/x-rar-compressed', 'application/java-archive',
-        'application/x-shockwave-flash', 'application/x-msdownload',
-        'application/x-deb', 'application/x-rpm'
-    ]
-    
-    for binary_type in binary_types:
-        if content_type.startswith(binary_type):
-            return True
-    
-    return False
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
@@ -1553,7 +1534,7 @@ async def proxy_request(request: Request, path: str):
     
     # Check if request contains binary data
     content_type = request.headers.get("content-type", "").lower()
-    is_binary_request = _is_binary_content(content_type)
+    is_binary_request = is_binary_content(content_type)
     
     request_data = {
         "method": request.method,
