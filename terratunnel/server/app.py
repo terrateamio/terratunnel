@@ -661,6 +661,9 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=1008, reason="Missing local_endpoint")
             return
         
+        # Check if client requested a specific subdomain
+        requested_subdomain = client_info.get("subdomain")
+        
         # Authenticate using middleware
         if auth_middleware:
             auth_result = await auth_middleware.authenticate_websocket(websocket, client_info)
@@ -681,17 +684,44 @@ async def websocket_endpoint(websocket: WebSocket):
                     username = user['provider_username']
                     logger.info(f"     Authenticated tunnel creation for user: {username} (ID: {user_id})")
                     
-                # Use the user's static subdomain
-                if tunnel_subdomain:
+                # Check if admin user requested a specific subdomain
+                if requested_subdomain and is_admin_user(user):
+                    # Check if subdomain is already in use
+                    with manager.lock:
+                        if requested_subdomain in manager.active_connections:
+                            logger.warning(f"Admin user {username} requested subdomain {requested_subdomain} but it's already in use")
+                            await websocket.close(code=1008, reason="Requested subdomain is already in use")
+                            return
+                    
+                    # Admin users can use custom subdomains
+                    subdomain = requested_subdomain
+                    logger.info(f"Admin user {username} using custom subdomain: {subdomain}")
+                    # Strip port from domain for hostname lookup
+                    domain_without_port = manager.domain.split(':')[0]
+                    hostname = f"{subdomain}.{domain_without_port}"
+                elif requested_subdomain and not is_admin_user(user):
+                    # Non-admin users cannot specify subdomains
+                    logger.warning(f"Non-admin user {username} tried to use custom subdomain: {requested_subdomain}")
+                    await websocket.close(code=1008, reason="Custom subdomains are only available to admin users")
+                    return
+                elif tunnel_subdomain:
+                    # Use the user's static subdomain
                     subdomain = tunnel_subdomain
                     # Strip port from domain for hostname lookup
                     domain_without_port = manager.domain.split(':')[0]
                     hostname = f"{subdomain}.{domain_without_port}"
                 else:
-                    # This shouldn't happen if the database migration worked correctly
-                    logger.error(f"User {user_id} has no tunnel_subdomain assigned")
-                    await websocket.close(code=1008, reason="No tunnel subdomain assigned")
-                    return
+                    # Admin users without a tunnel_subdomain can get a new one
+                    if is_admin_user(user):
+                        subdomain = manager.generate_subdomain()
+                        domain_without_port = manager.domain.split(':')[0]
+                        hostname = f"{subdomain}.{domain_without_port}"
+                        logger.info(f"Admin user {username} generated new subdomain: {subdomain}")
+                    else:
+                        # This shouldn't happen if the database migration worked correctly
+                        logger.error(f"User {user_id} has no tunnel_subdomain assigned")
+                        await websocket.close(code=1008, reason="No tunnel subdomain assigned")
+                        return
             else:
                 # No authentication - generate random subdomain
                 subdomain = manager.generate_subdomain()
@@ -799,6 +829,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 db.log_disconnection(subdomain, connection_id)
 
 
+def is_admin_user(user: dict) -> bool:
+    """Check if a user is an admin"""
+    if not user:
+        return False
+    return Config.is_admin_user(user.get("provider"), user.get("username"))
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
     """Home page with login/dashboard"""
@@ -816,6 +853,8 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         # Get user's API keys and tunnel subdomain
         api_keys = []
         user_details = None
+        is_admin = is_admin_user(user)
+        
         if db:
             api_keys = db.list_user_api_keys(user["id"])
             user_details = db.get_user_by_id(user["id"])
@@ -1038,6 +1077,174 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         html += """
                     </div>
                 </div>
+        """
+        
+        # Add multiple tunnels section for admin users
+        if is_admin:
+            html += """
+                <div class="card">
+                    <h1>🚀 Multiple Tunnels (Admin Feature)</h1>
+                    <p>As an administrator, you can create multiple tunnels by specifying custom subdomains when connecting.</p>
+                    
+                    <h3>Create Additional Tunnels</h3>
+                    <p>Use the <code>--subdomain</code> flag to create custom tunnels:</p>
+                    <div class="code-block">python -m terratunnel client \\
+    --subdomain my-custom-tunnel \\
+    --local-endpoint http://localhost:3000</div>
+                    
+                    <p>This will create a tunnel at: <code>https://my-custom-tunnel.""" + manager.domain + """</code></p>
+                    
+                    <h3>Examples</h3>
+                    <ul style="line-height: 1.8;">
+                        <li>Development API: <code>--subdomain dev-api</code></li>
+                        <li>Staging Environment: <code>--subdomain staging-app</code></li>
+                        <li>Testing Webhook: <code>--subdomain test-webhook</code></li>
+                    </ul>
+                    
+                    <p style="margin-top: 20px;"><strong>Note:</strong> Each subdomain must be unique. If a subdomain is already in use, the connection will be rejected.</p>
+                </div>
+        """
+        
+        # Add admin section if user is admin
+        if is_admin:
+            # Gather tunnel data for admin view
+            tunnels = []
+            with manager.lock:
+                for hostname, subdomain in manager.hostname_to_subdomain.items():
+                    endpoint = manager.subdomain_to_endpoint.get(subdomain)
+                    websocket = manager.active_connections.get(subdomain)
+                    tunnels.append({
+                        "hostname": hostname,
+                        "subdomain": subdomain, 
+                        "endpoint": endpoint,
+                        "connected": websocket is not None,
+                        "url": f"https://{hostname}"
+                    })
+            
+            # Sort by hostname
+            tunnels.sort(key=lambda x: x["hostname"])
+            
+            # Get recent audit logs
+            recent_logs = []
+            if db:
+                try:
+                    recent_logs = db.get_audit_logs(limit=10)
+                except:
+                    pass
+            
+            html += f"""
+                <div class="card">
+                    <h1>🛡️ Admin Dashboard</h1>
+                    <p>You have administrator privileges. Here's an overview of all active tunnels.</p>
+                    
+                    <h2>Active Tunnels ({len([t for t in tunnels if t['connected']])})</h2>
+                    <div style="overflow-x: auto;">
+                        <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                            <thead>
+                                <tr>
+                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Hostname</th>
+                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Endpoint</th>
+                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+            """
+            
+            for tunnel in tunnels:
+                if tunnel['connected']:
+                    status_badge = '<span style="color: #28a745;">● Connected</span>'
+                    html += f"""
+                                <tr>
+                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8;">
+                                        <a href="{tunnel['url']}" target="_blank" style="color: #0066cc; text-decoration: none;">
+                                            {tunnel['hostname']}
+                                        </a>
+                                    </td>
+                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8; font-family: monospace; font-size: 13px;">
+                                        {tunnel['endpoint'] or '-'}
+                                    </td>
+                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8;">
+                                        {status_badge}
+                                    </td>
+                                </tr>
+                    """
+            
+            if not any(t['connected'] for t in tunnels):
+                html += """
+                                <tr>
+                                    <td colspan="3" style="padding: 20px; text-align: center; color: #666;">
+                                        No active tunnels
+                                    </td>
+                                </tr>
+                """
+            
+            html += """
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h2 style="margin-top: 30px;">Recent Connections</h2>
+                    <div style="overflow-x: auto;">
+                        <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                            <thead>
+                                <tr>
+                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">User</th>
+                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Subdomain</th>
+                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Connected</th>
+                                    <th style="text-align: left; padding: 12px; background: #f6f8fa; border-bottom: 1px solid #e1e4e8;">Duration</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+            """
+            
+            for log in recent_logs[:10]:
+                connected_at = log.get('connected_at', '')
+                disconnected_at = log.get('disconnected_at', '')
+                duration = '-'
+                if connected_at and disconnected_at:
+                    try:
+                        from datetime import datetime
+                        start = datetime.fromisoformat(connected_at.replace(' ', 'T'))
+                        end = datetime.fromisoformat(disconnected_at.replace(' ', 'T'))
+                        delta = end - start
+                        duration = str(delta).split('.')[0]  # Remove microseconds
+                    except:
+                        pass
+                
+                html += f"""
+                                <tr>
+                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8;">
+                                        {log.get('username', 'Unknown')}
+                                    </td>
+                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8; font-family: monospace; font-size: 13px;">
+                                        {log.get('subdomain', '-')}
+                                    </td>
+                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8; color: #666; font-size: 13px;">
+                                        {connected_at}
+                                    </td>
+                                    <td style="padding: 12px; border-bottom: 1px solid #e1e4e8;">
+                                        {duration}
+                                    </td>
+                                </tr>
+                """
+            
+            if not recent_logs:
+                html += """
+                                <tr>
+                                    <td colspan="4" style="padding: 20px; text-align: center; color: #666;">
+                                        No recent connections
+                                    </td>
+                                </tr>
+                """
+            
+            html += """
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            """
+        
+        html += """
             </div>
         </body>
         </html>
@@ -1593,339 +1800,6 @@ async def health_check():
     return {"status": "healthy", "active_connections": len(manager.active_connections)}
 
 
-@app.get("/_admin", response_class=HTMLResponse)
-async def admin_dashboard(request: Request, current_user = Depends(require_admin_user)):
-    """Admin dashboard - protected by OAuth authentication"""
-    # If require_admin_user returns a RedirectResponse or HTMLResponse, return it
-    if isinstance(current_user, (RedirectResponse, HTMLResponse)):
-        return current_user
-    
-    # Gather tunnel data
-    tunnels = []
-    with manager.lock:
-        for hostname, subdomain in manager.hostname_to_subdomain.items():
-            endpoint = manager.subdomain_to_endpoint.get(subdomain)
-            websocket = manager.active_connections.get(subdomain)
-            tunnels.append({
-                "hostname": hostname,
-                "subdomain": subdomain,
-                "endpoint": endpoint,
-                "connected": websocket is not None,
-                "url": f"https://{hostname}"
-            })
-    
-    # Sort by hostname
-    tunnels.sort(key=lambda x: x["hostname"])
-    
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Terratunnel Admin</title>
-        <style>
-            @font-face {{
-                font-family: 'Apertura';
-                src: url('/fonts/Apertura_Regular.otf') format('opentype');
-                font-weight: 400;
-                font-style: normal;
-            }}
-            @font-face {{
-                font-family: 'Apertura';
-                src: url('/fonts/Apertura_Medium.otf') format('opentype');
-                font-weight: 500;
-                font-style: normal;
-            }}
-            @font-face {{
-                font-family: 'Apertura';
-                src: url('/fonts/Apertura_Bold.otf') format('opentype');
-                font-weight: 700;
-                font-style: normal;
-            }}
-            body {{
-                font-family: 'Apertura', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                margin: 0;
-                padding: 20px;
-                background: #f5f5f5;
-            }}
-            .container {{
-                max-width: 1200px;
-                margin: 0 auto;
-                background: white;
-                padding: 20px;
-                border-radius: 8px;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            }}
-            h1 {{
-                margin-top: 0;
-                color: #333;
-            }}
-            .stats {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 20px;
-                margin-bottom: 30px;
-            }}
-            .stat {{
-                padding: 20px;
-                background: #f8f9fa;
-                border-radius: 8px;
-                text-align: center;
-            }}
-            .stat-value {{
-                font-size: 2em;
-                font-weight: bold;
-                color: #0066cc;
-            }}
-            .stat-label {{
-                color: #666;
-                margin-top: 5px;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-            }}
-            th, td {{
-                padding: 12px;
-                text-align: left;
-                border-bottom: 1px solid #eee;
-            }}
-            th {{
-                background: #f8f9fa;
-                font-weight: 600;
-                color: #333;
-            }}
-            tr:hover {{
-                background: #f8f9fa;
-            }}
-            .status {{
-                display: inline-block;
-                width: 10px;
-                height: 10px;
-                border-radius: 50%;
-                margin-right: 5px;
-            }}
-            .connected {{
-                background: #00d084;
-            }}
-            .disconnected {{
-                background: #ff6b6b;
-            }}
-            .url {{
-                color: #0066cc;
-                text-decoration: none;
-            }}
-            .url:hover {{
-                text-decoration: underline;
-            }}
-            .endpoint {{
-                font-family: monospace;
-                font-size: 0.9em;
-                color: #666;
-            }}
-            code {{
-                font-family: monospace;
-                font-size: 0.9em;
-                background: #f0f0f0;
-                padding: 2px 4px;
-                border-radius: 3px;
-            }}
-            .refresh {{
-                margin-top: 20px;
-                text-align: center;
-                color: #666;
-                font-size: 0.9em;
-            }}
-            .empty {{
-                text-align: center;
-                padding: 40px;
-                color: #666;
-            }}
-            .header {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 20px;
-            }}
-            .settings {{
-                color: #666;
-                font-size: 0.9em;
-            }}
-        </style>
-        <meta http-equiv="refresh" content="10">
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1><img src="/logo-symbol.svg" alt="Terratunnel" style="height: 64px; vertical-align: middle; margin-right: 8px;">Terratunnel Admin</h1>
-                <div class="settings">
-                    Domain: {manager.domain} | 
-                    User: {current_user['username']} ({current_user['provider']})
-                </div>
-            </div>
-            
-            <div class="stats">
-                <div class="stat">
-                    <div class="stat-value">{len(tunnels)}</div>
-                    <div class="stat-label">Active Tunnels</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value">{len([t for t in tunnels if t['connected']])}</div>
-                    <div class="stat-label">Connected</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value">{len(manager.active_connections)}</div>
-                    <div class="stat-label">WebSocket Connections</div>
-                </div>
-            </div>
-            
-            <h2>Active Tunnels</h2>
-            """
-    
-    if tunnels:
-        html += """
-            <table>
-                <thead>
-                    <tr>
-                        <th>Status</th>
-                        <th>Hostname</th>
-                        <th>Local Endpoint</th>
-                        <th>Subdomain</th>
-                    </tr>
-                </thead>
-                <tbody>
-        """
-        for tunnel in tunnels:
-            status_class = 'connected' if tunnel['connected'] else 'disconnected'
-            status_text = 'Connected' if tunnel['connected'] else 'Disconnected'
-            endpoint = tunnel['endpoint'] or 'N/A'
-            
-            html += f"""
-                    <tr>
-                        <td>
-                            <span class="status {status_class}"></span>
-                            {status_text}
-                        </td>
-                        <td>
-                            <a href="{tunnel['url']}" target="_blank" class="url">{tunnel['hostname']}</a>
-                        </td>
-                        <td>
-                            <span class="endpoint">{endpoint}</span>
-                        </td>
-                        <td>{tunnel['subdomain']}</td>
-                    </tr>
-            """
-        html += """
-                </tbody>
-            </table>
-        """
-    else:
-        html += '<div class="empty">No active tunnels</div>'
-    
-    # Add recent connections section
-    if db:
-        recent_connections = db.get_recent_connections(limit=10)
-        if recent_connections:
-            html += """
-            
-            <h2 style="margin-top: 40px;">Recent Connections</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Timestamp</th>
-                        <th>Tunnel ID</th>
-                        <th>Hostname</th>
-                        <th>User</th>
-                        <th>Local Endpoint</th>
-                        <th>Client IP</th>
-                    </tr>
-                </thead>
-                <tbody>
-            """
-            for conn in recent_connections:
-                timestamp = conn['timestamp']
-                subdomain = conn['subdomain']
-                hostname = conn['hostname']
-                username = conn.get('username') or 'anonymous'
-                endpoint = conn['local_endpoint']
-                client_ip = conn['client_ip'] or 'N/A'
-                
-                html += f"""
-                    <tr>
-                        <td>{timestamp}</td>
-                        <td><code>{subdomain}</code></td>
-                        <td><span class="endpoint">{hostname}</span></td>
-                        <td>{username}</td>
-                        <td><span class="endpoint">{endpoint}</span></td>
-                        <td>{client_ip}</td>
-                    </tr>
-                """
-            html += """
-                </tbody>
-            </table>
-            """
-    
-    html += """
-            
-            <div class="refresh">
-                Auto-refreshing every 10 seconds | <a href="/_admin">Refresh now</a>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return HTMLResponse(content=html)
-
-
-@app.get("/_admin/api/tunnels")
-async def admin_api_tunnels(request: Request, current_user = Depends(require_admin_user)):
-    """Admin API endpoint - returns JSON data"""
-    # If require_admin_user returns a RedirectResponse or HTMLResponse, convert to appropriate error
-    if isinstance(current_user, RedirectResponse):
-        raise HTTPException(status_code=401, detail="Authentication required")
-    if isinstance(current_user, HTMLResponse):
-        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
-    
-    tunnels = {}
-    with manager.lock:
-        for hostname, subdomain in manager.hostname_to_subdomain.items():
-            tunnels[hostname] = {
-                "subdomain": subdomain,
-                "endpoint": manager.subdomain_to_endpoint.get(subdomain),
-                "connected": subdomain in manager.active_connections
-            }
-    
-    return {
-        "tunnels": tunnels,
-        "stats": {
-            "total_tunnels": len(tunnels),
-            "connected": len([t for t in tunnels.values() if t["connected"]]),
-            "websocket_connections": len(manager.active_connections)
-        },
-        "config": {
-            "domain": manager.domain
-        }
-    }
-
-
-@app.get("/_admin/api/audit")
-async def admin_api_audit(request: Request, current_user = Depends(require_admin_user), limit: int = 100):
-    """Admin API endpoint - returns audit log data"""
-    # If require_admin_user returns a RedirectResponse or HTMLResponse, convert to appropriate error
-    if isinstance(current_user, RedirectResponse):
-        raise HTTPException(status_code=401, detail="Authentication required")
-    if isinstance(current_user, HTMLResponse):
-        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
-    
-    if not db:
-        return {"error": "Database not initialized"}
-    
-    recent_connections = db.get_recent_connections(limit=limit)
-    
-    return {
-        "connections": recent_connections,
-        "total": len(recent_connections)
-    }
 
 
 

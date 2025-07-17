@@ -243,12 +243,24 @@ TERRATUNNEL_DB_PATH=/data/terratunnel.db
 # Request logging (optional - disabled by default)
 # Set this to enable detailed request/response logging to a file
 # TERRATUNNEL_REQUEST_LOG=./terratunnel_requests.log
+
+# File size limits (optional - defaults shown)
+# Maximum request/response size to prevent OOM issues
+# TERRATUNNEL_MAX_REQUEST_SIZE=52428800  # 50MB
+# TERRATUNNEL_MAX_RESPONSE_SIZE=52428800  # 50MB
 ```
 
 ### Common Issues and Solutions
 
 1. **"Cannot add a UNIQUE column" during migration**
    - Solution: Start fresh with new database or manually migrate data
+
+2. **"File too large" error or server crashes with OOM**
+   - Terratunnel automatically streams files larger than 10MB to prevent memory issues
+   - Files between 10-50MB are streamed in 512KB chunks with integrity checking
+   - Files larger than 50MB will return an HTTP 413 error (configurable)
+   - Adjust limits with TERRATUNNEL_MAX_REQUEST_SIZE and TERRATUNNEL_MAX_RESPONSE_SIZE
+   - WebSocket message size limit is 512MB to accommodate chunked transfers
 
 2. **Client authentication failures**
    - Ensure API key is in Authorization header: `Authorization: Bearer your_key`
@@ -300,6 +312,27 @@ TERRATUNNEL_DB_PATH=/data/terratunnel.db
    - Update client with new key
    - Old key is automatically deactivated
 
+### Streaming Large Files
+
+Terratunnel automatically handles large file transfers using a chunked streaming protocol:
+
+1. **Automatic Streaming**: Files larger than 10MB are automatically streamed in chunks
+2. **Memory Efficient**: Only 512KB is held in memory at a time during transfers
+3. **Integrity Checking**: Each chunk includes SHA256 checksums for verification
+4. **Transparent**: The streaming is transparent to HTTP clients - they see normal responses
+5. **Progress Tracking**: Debug logs show chunk transfer progress
+
+**How it works**:
+- Client detects large responses and sends initial response with streaming metadata
+- File data is sent in separate chunk messages with checksums
+- Server reassembles chunks and verifies integrity before sending to HTTP client
+- Errors during streaming are handled gracefully with proper error messages
+
+**Configuration**:
+- `STREAMING_THRESHOLD`: Files larger than this use streaming (default: 10MB)
+- `DEFAULT_CHUNK_SIZE`: Size of each chunk (default: 512KB)
+- `TERRATUNNEL_MAX_RESPONSE_SIZE`: Maximum file size before returning 413 error (default: 50MB)
+
 ### Recent Changes (July 2025)
 
 1. **Static Tunnel URLs**: Each user now gets a permanent subdomain (e.g., `gentle-tiger-swimming.yourdomain.com`) that doesn't change when API keys are rotated.
@@ -319,3 +352,17 @@ TERRATUNNEL_DB_PATH=/data/terratunnel.db
      - Adds request UUID to console logs
      - Saves full request/response details to specified log file
      - Human-readable format with clear section separators
+
+7. **Streaming for Large Files**: 
+   - Automatic chunked streaming for files larger than 10MB
+   - Prevents OOM errors by processing files in 512KB chunks
+   - Includes integrity checking with SHA256 checksums per chunk
+   - Transparent to HTTP clients - no changes needed
+   - WebSocket message size increased to 512MB to support large transfers
+
+8. **Admin Features Update**:
+   - Removed separate admin dashboard at /_admin
+   - Integrated admin features into main dashboard at /
+   - Admin users can create multiple tunnels using `--subdomain` flag
+   - Example: `python -m terratunnel client --subdomain custom-name --local-endpoint http://localhost:3000`
+   - Admin dashboard shows all active tunnels and recent connections
