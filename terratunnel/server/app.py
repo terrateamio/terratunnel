@@ -802,6 +802,473 @@ def is_admin_user(user: dict) -> bool:
     return Config.is_admin_user(user.get("provider"), user.get("username"))
 
 
+@app.get("/admin/database", response_class=HTMLResponse)
+async def admin_database_browser(request: Request, auth_token: Optional[str] = Cookie(None)):
+    """Admin database browser interface"""
+    # Verify auth
+    user = None
+    if auth_token:
+        try:
+            from .auth import verify_jwt_token
+            user = verify_jwt_token(auth_token)
+        except:
+            pass
+    
+    # Check admin access
+    if not user or not is_admin_user(user):
+        return RedirectResponse(url="/auth/login", status_code=303)
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Database Browser - Terratunnel Admin</title>
+        <style>
+            @font-face {{
+                font-family: 'Apertura';
+                src: url('/fonts/Apertura_Regular.otf') format('opentype');
+                font-weight: 400;
+                font-style: normal;
+            }}
+            @font-face {{
+                font-family: 'Apertura';
+                src: url('/fonts/Apertura_Medium.otf') format('opentype');
+                font-weight: 500;
+                font-style: normal;
+            }}
+            @font-face {{
+                font-family: 'Apertura';
+                src: url('/fonts/Apertura_Bold.otf') format('opentype');
+                font-weight: 700;
+                font-style: normal;
+            }}
+            body {{
+                font-family: 'Apertura', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                margin: 0;
+                padding: 0;
+                background: #f5f5f5;
+                color: #333;
+            }}
+            .container {{
+                max-width: 1200px;
+                margin: 0 auto;
+                padding: 20px;
+            }}
+            .header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 30px;
+            }}
+            h1 {{
+                margin: 0;
+                font-size: 28px;
+                color: #333;
+            }}
+            .nav-buttons {{
+                display: flex;
+                gap: 10px;
+            }}
+            .button {{
+                display: inline-block;
+                padding: 10px 20px;
+                background: #0066cc;
+                color: white;
+                text-decoration: none;
+                border-radius: 5px;
+                font-weight: 500;
+                border: none;
+                cursor: pointer;
+                font-size: 14px;
+            }}
+            .button:hover {{
+                background: #0052a3;
+            }}
+            .button.secondary {{
+                background: #666;
+            }}
+            .button.secondary:hover {{
+                background: #555;
+            }}
+            .card {{
+                background: white;
+                border-radius: 8px;
+                padding: 20px;
+                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+                margin-bottom: 20px;
+            }}
+            .tables-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+                gap: 15px;
+                margin-bottom: 30px;
+            }}
+            .table-card {{
+                background: #f8f9fa;
+                border: 1px solid #e1e4e8;
+                border-radius: 6px;
+                padding: 15px;
+                cursor: pointer;
+                transition: all 0.2s;
+            }}
+            .table-card:hover {{
+                background: #f0f3f6;
+                border-color: #0066cc;
+                transform: translateY(-2px);
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            }}
+            .table-name {{
+                font-weight: 600;
+                font-size: 16px;
+                margin-bottom: 5px;
+                color: #0066cc;
+            }}
+            .table-info {{
+                font-size: 13px;
+                color: #666;
+            }}
+            #tableContent {{
+                display: none;
+            }}
+            .data-table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 20px;
+                font-size: 14px;
+            }}
+            .data-table th {{
+                background: #f6f8fa;
+                border: 1px solid #e1e4e8;
+                padding: 10px;
+                text-align: left;
+                font-weight: 600;
+                position: sticky;
+                top: 0;
+                z-index: 10;
+            }}
+            .data-table td {{
+                border: 1px solid #e1e4e8;
+                padding: 8px;
+                word-break: break-word;
+                max-width: 300px;
+            }}
+            .data-table tr:hover {{
+                background: #f8f9fa;
+            }}
+            .pagination {{
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                gap: 10px;
+                margin-top: 20px;
+            }}
+            .pagination button {{
+                padding: 5px 10px;
+                background: #0066cc;
+                color: white;
+                border: none;
+                border-radius: 3px;
+                cursor: pointer;
+                font-size: 13px;
+            }}
+            .pagination button:disabled {{
+                background: #ccc;
+                cursor: not-allowed;
+            }}
+            .pagination button:hover:not(:disabled) {{
+                background: #0052a3;
+            }}
+            .loading {{
+                text-align: center;
+                padding: 40px;
+                color: #666;
+            }}
+            .error {{
+                background: #fef2f2;
+                color: #dc2626;
+                padding: 15px;
+                border-radius: 6px;
+                margin: 20px 0;
+            }}
+            .download-section {{
+                margin-top: 30px;
+                padding: 20px;
+                background: #f8f9fa;
+                border-radius: 6px;
+                text-align: center;
+            }}
+            .query-section {{
+                margin-bottom: 20px;
+            }}
+            .query-input {{
+                width: 100%;
+                min-height: 80px;
+                padding: 10px;
+                font-family: monospace;
+                font-size: 14px;
+                border: 1px solid #e1e4e8;
+                border-radius: 4px;
+                resize: vertical;
+            }}
+            .query-buttons {{
+                margin-top: 10px;
+                display: flex;
+                gap: 10px;
+            }}
+            #backButton {{
+                display: none;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🗄️ Database Browser</h1>
+                <div class="nav-buttons">
+                    <button id="backButton" class="button secondary" onclick="showTables()">← Back to Tables</button>
+                    <a href="/" class="button secondary">Dashboard</a>
+                </div>
+            </div>
+            
+            <div id="tablesView">
+                <div class="card">
+                    <h2>Database Tables</h2>
+                    <div id="tablesList" class="loading">Loading tables...</div>
+                </div>
+                
+                <div class="card query-section">
+                    <h2>Custom Query</h2>
+                    <textarea id="queryInput" class="query-input" placeholder="Enter SELECT query here...">SELECT * FROM users LIMIT 10</textarea>
+                    <div class="query-buttons">
+                        <button class="button" onclick="executeQuery()">Execute Query</button>
+                        <button class="button secondary" onclick="clearQuery()">Clear</button>
+                    </div>
+                    <div id="queryResult"></div>
+                </div>
+                
+                <div class="download-section">
+                    <h3>Download Database</h3>
+                    <p>Download the complete SQLite database file for offline analysis.</p>
+                    <a href="/api/admin/db/download" class="button" download>Download Database</a>
+                </div>
+            </div>
+            
+            <div id="tableContent" class="card">
+                <h2 id="tableTitle"></h2>
+                <div id="tableData" class="loading">Loading data...</div>
+            </div>
+        </div>
+        
+        <script>
+            let currentTable = null;
+            let currentPage = 1;
+            let totalPages = 1;
+            
+            // Load tables on page load
+            window.onload = function() {{
+                loadTables();
+            }};
+            
+            async function loadTables() {{
+                try {{
+                    const response = await fetch('/api/admin/db/tables', {{
+                        credentials: 'include'
+                    }});
+                    
+                    if (!response.ok) {{
+                        throw new Error('Failed to load tables');
+                    }}
+                    
+                    const data = await response.json();
+                    displayTables(data.tables);
+                }} catch (error) {{
+                    document.getElementById('tablesList').innerHTML = 
+                        '<div class="error">Error loading tables: ' + error.message + '</div>';
+                }}
+            }}
+            
+            function displayTables(tables) {{
+                let html = '<div class="tables-grid">';
+                
+                tables.forEach(table => {{
+                    html += `
+                        <div class="table-card" onclick="loadTable('${{table.name}}')">
+                            <div class="table-name">${{table.name}}</div>
+                            <div class="table-info">
+                                ${{table.row_count}} rows • ${{table.columns.length}} columns
+                            </div>
+                        </div>
+                    `;
+                }});
+                
+                html += '</div>';
+                document.getElementById('tablesList').innerHTML = html;
+            }}
+            
+            async function loadTable(tableName, page = 1) {{
+                currentTable = tableName;
+                currentPage = page;
+                
+                // Show table view
+                document.getElementById('tablesView').style.display = 'none';
+                document.getElementById('tableContent').style.display = 'block';
+                document.getElementById('backButton').style.display = 'block';
+                
+                document.getElementById('tableTitle').textContent = tableName;
+                document.getElementById('tableData').innerHTML = '<div class="loading">Loading data...</div>';
+                
+                try {{
+                    const response = await fetch(`/api/admin/db/tables/${{tableName}}?page=${{page}}&page_size=50`, {{
+                        credentials: 'include'
+                    }});
+                    
+                    if (!response.ok) {{
+                        throw new Error('Failed to load table data');
+                    }}
+                    
+                    const data = await response.json();
+                    totalPages = data.total_pages;
+                    displayTableData(data);
+                }} catch (error) {{
+                    document.getElementById('tableData').innerHTML = 
+                        '<div class="error">Error loading table data: ' + error.message + '</div>';
+                }}
+            }}
+            
+            function displayTableData(data) {{
+                let html = '<div style="overflow-x: auto;">';
+                html += '<table class="data-table">';
+                
+                // Header
+                html += '<thead><tr>';
+                data.columns.forEach(col => {{
+                    html += `<th>${{col}}</th>`;
+                }});
+                html += '</tr></thead>';
+                
+                // Body
+                html += '<tbody>';
+                data.rows.forEach(row => {{
+                    html += '<tr>';
+                    data.columns.forEach(col => {{
+                        let value = row[col];
+                        if (value === null) {{
+                            value = '<em style="color: #999;">NULL</em>';
+                        }} else if (typeof value === 'string' && value.length > 100) {{
+                            value = value.substring(0, 100) + '...';
+                        }}
+                        html += `<td>${{value}}</td>`;
+                    }});
+                    html += '</tr>';
+                }});
+                
+                if (data.rows.length === 0) {{
+                    html += '<tr><td colspan="' + data.columns.length + '" style="text-align: center; color: #666;">No data found</td></tr>';
+                }}
+                
+                html += '</tbody></table></div>';
+                
+                // Pagination
+                html += '<div class="pagination">';
+                html += `<button onclick="loadTable('${{currentTable}}', 1)" ${{currentPage === 1 ? 'disabled' : ''}}>First</button>`;
+                html += `<button onclick="loadTable('${{currentTable}}', ${{currentPage - 1}})" ${{currentPage === 1 ? 'disabled' : ''}}>Previous</button>`;
+                html += `<span>Page ${{currentPage}} of ${{totalPages}}</span>`;
+                html += `<button onclick="loadTable('${{currentTable}}', ${{currentPage + 1}})" ${{currentPage === totalPages ? 'disabled' : ''}}>Next</button>`;
+                html += `<button onclick="loadTable('${{currentTable}}', ${{totalPages}})" ${{currentPage === totalPages ? 'disabled' : ''}}>Last</button>`;
+                html += '</div>';
+                
+                document.getElementById('tableData').innerHTML = html;
+            }}
+            
+            function showTables() {{
+                document.getElementById('tablesView').style.display = 'block';
+                document.getElementById('tableContent').style.display = 'none';
+                document.getElementById('backButton').style.display = 'none';
+            }}
+            
+            async function executeQuery() {{
+                const query = document.getElementById('queryInput').value.trim();
+                if (!query) {{
+                    alert('Please enter a query');
+                    return;
+                }}
+                
+                document.getElementById('queryResult').innerHTML = '<div class="loading">Executing query...</div>';
+                
+                try {{
+                    const response = await fetch('/api/admin/db/query?query=' + encodeURIComponent(query), {{
+                        credentials: 'include'
+                    }});
+                    
+                    const data = await response.json();
+                    
+                    if (!response.ok) {{
+                        throw new Error(data.detail || 'Query failed');
+                    }}
+                    
+                    displayQueryResults(data);
+                }} catch (error) {{
+                    document.getElementById('queryResult').innerHTML = 
+                        '<div class="error">Error: ' + error.message + '</div>';
+                }}
+            }}
+            
+            function displayQueryResults(data) {{
+                let html = '<h3>Query Results (' + data.row_count + ' rows)</h3>';
+                html += '<div style="overflow-x: auto; max-height: 400px;">';
+                html += '<table class="data-table">';
+                
+                // Header
+                html += '<thead><tr>';
+                data.columns.forEach(col => {{
+                    html += `<th>${{col}}</th>`;
+                }});
+                html += '</tr></thead>';
+                
+                // Body
+                html += '<tbody>';
+                data.rows.forEach(row => {{
+                    html += '<tr>';
+                    data.columns.forEach(col => {{
+                        let value = row[col];
+                        if (value === null) {{
+                            value = '<em style="color: #999;">NULL</em>';
+                        }} else if (typeof value === 'string' && value.length > 100) {{
+                            value = value.substring(0, 100) + '...';
+                        }}
+                        html += `<td>${{value}}</td>`;
+                    }});
+                    html += '</tr>';
+                }});
+                
+                if (data.rows.length === 0) {{
+                    html += '<tr><td colspan="' + data.columns.length + '" style="text-align: center; color: #666;">No results</td></tr>';
+                }}
+                
+                html += '</tbody></table></div>';
+                
+                document.getElementById('queryResult').innerHTML = html;
+            }}
+            
+            function clearQuery() {{
+                document.getElementById('queryInput').value = '';
+                document.getElementById('queryResult').innerHTML = '';
+            }}
+            
+            function getCookie(name) {{
+                const value = `; ${{document.cookie}}`;
+                const parts = value.split(`; ${{name}}=`);
+                if (parts.length === 2) return parts.pop().split(';').shift();
+                return '';
+            }}
+        </script>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
     """Home page with login/dashboard"""
@@ -1092,6 +1559,10 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                 <div class="card">
                     <h1>🛡️ Admin Dashboard</h1>
                     <p>You have administrator privileges. Here's an overview of all active tunnels.</p>
+                    
+                    <div style="margin-bottom: 20px;">
+                        <a href="/admin/database" class="button">Browse Database</a>
+                    </div>
                     
                     <h2>Active Tunnels ({len([t for t in active_tunnels if t['connected']])})</h2>
                     <div style="overflow-x: auto;">
