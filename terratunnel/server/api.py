@@ -178,3 +178,4 @@ async def revoke_api_key(key_id: int, api_key_info: dict = Depends(get_current_u
         return {"message": "API key revoked successfully"}
     else:
         raise HTTPException(status_code=404, detail="API key not found or not owned by user")
+

@@ -96,6 +96,44 @@ async def github_oauth_redirect(request: Request, redirect_uri: Optional[str] = 
     return RedirectResponse(url=authorization_url, status_code=302)
 
 
+@auth_router.get("/github/authorize")
+async def github_oauth_authorize_proxy(
+    request: Request,
+    redirect_uri: str,
+    state: Optional[str] = None
+):
+    """OAuth proxy endpoint for third-party integrations like Terrateam setup wizard"""
+    if not Config.has_github_oauth():
+        raise HTTPException(status_code=503, detail="GitHub OAuth not configured")
+    
+    # Store the external redirect URI and state for later
+    internal_state = generate_state()
+    
+    # Store both the external redirect_uri and external state
+    oauth_states[f"{internal_state}_external_redirect"] = redirect_uri
+    if state:
+        oauth_states[f"{internal_state}_external_state"] = state
+    
+    # Get the server's domain from request
+    host = request.headers.get("host", "localhost")
+    is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+    callback_uri = Config.get_github_oauth_redirect_uri(host, is_https)
+    
+    # Build GitHub OAuth URL with our internal callback
+    github_oauth_url = "https://github.com/login/oauth/authorize"
+    params = {
+        "client_id": Config.GITHUB_CLIENT_ID,
+        "redirect_uri": callback_uri,
+        "scope": "read:user user:email",
+        "state": internal_state,
+        "allow_signup": "true"
+    }
+    
+    from urllib.parse import urlencode
+    authorization_url = f"{github_oauth_url}?{urlencode(params)}"
+    return RedirectResponse(url=authorization_url, status_code=302)
+
+
 @auth_router.get("/github/callback")
 async def github_oauth_callback(
     request: Request,
@@ -105,12 +143,35 @@ async def github_oauth_callback(
     error_description: Optional[str] = None
 ):
     """Handle OAuth callback from GitHub"""
-    # Check for OAuth errors
+    # Check for OAuth errors first
     if error:
-        error_msg = f"OAuth error: {error}"
-        if error_description:
-            error_msg += f" - {error_description}"
-        raise HTTPException(status_code=400, detail=error_msg)
+        # Check if this is an external OAuth proxy request that had an error
+        external_redirect_uri = oauth_states.get(f"{state}_external_redirect")
+        if external_redirect_uri:
+            # Get external state before cleaning up
+            external_state_err = oauth_states.get(f"{state}_external_state")
+            
+            # Clean up state
+            oauth_states.pop(f"{state}_external_redirect", None)
+            oauth_states.pop(f"{state}_external_state", None)
+            
+            # Redirect back to external service with error
+            from urllib.parse import urlencode
+            error_params = {
+                "error": error,
+                "error_description": error_description or "OAuth authorization failed"
+            }
+            if external_state_err:
+                error_params["state"] = external_state_err
+            
+            redirect_url = f"{external_redirect_uri}?{urlencode(error_params)}"
+            return RedirectResponse(url=redirect_url, status_code=302)
+        else:
+            # Normal error handling
+            error_msg = f"OAuth error: {error}"
+            if error_description:
+                error_msg += f" - {error_description}"
+            raise HTTPException(status_code=400, detail=error_msg)
     
     # Verify state parameter
     if not verify_state(state):
@@ -187,12 +248,90 @@ async def github_oauth_callback(
     
     jwt_token = jwt.encode(jwt_payload, Config.JWT_SECRET, algorithm=Config.JWT_ALGORITHM)
     
-    # Check if there was a redirect URI stored
+    # Check if there was a redirect URI stored (normal auth flow)
     redirect_uri = oauth_states.pop(f"{state}_redirect", None)
     
-    # Create response based on context
-    if redirect_uri:
-        # Browser-based auth - set cookie and redirect
+    # Check if this is an external OAuth proxy request (from /auth/github/authorize)
+    external_redirect_uri = oauth_states.pop(f"{state}_external_redirect", None)
+    external_state = oauth_states.pop(f"{state}_external_state", None)
+    
+    if external_redirect_uri:
+        # This is from the OAuth proxy - create tunnel and redirect back with all data
+        try:
+            # Create API key for the user
+            api_key = db.create_api_key(
+                user_id=user_id,
+                name=f"Terrateam Setup Wizard - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            )
+            
+            # Get user's tunnel information
+            tunnel_subdomain = user.get("tunnel_subdomain")
+            if not tunnel_subdomain:
+                # This shouldn't happen with current migration but handle it gracefully
+                # Generate a new subdomain and update the user record
+                import sqlite3
+                conn = sqlite3.connect(db.db_path)
+                cursor = conn.cursor()
+                try:
+                    tunnel_subdomain = db._generate_unique_subdomain(cursor)
+                    cursor.execute(
+                        "UPDATE users SET tunnel_subdomain = ? WHERE id = ?", 
+                        (tunnel_subdomain, user_id)
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+            
+            # Get the tunnel URL - extract domain from the Host header
+            host = request.headers.get("host", "localhost")
+            # Remove port if present
+            domain = host.split(':')[0]
+            tunnel_url = f"https://{tunnel_subdomain}.{domain}"
+            
+            # Log tunnel creation details
+            import logging
+            logger = logging.getLogger("terratunnel-server")
+            logger.info(f"Created tunnel for user {github_user['login']}: {tunnel_url} (API key: {api_key[:8]}...)")
+            
+            # Build redirect URL with all required parameters
+            from urllib.parse import urlencode
+            params = {
+                "access_token": access_token,  # GitHub access token
+                "user_login": github_user["login"],
+                "user_id": str(github_user["id"]),
+                "tunnel_id": tunnel_subdomain,
+                "tunnel_url": tunnel_url,
+                "api_key": api_key
+            }
+            
+            # Add the original state if it was provided
+            if external_state:
+                params["state"] = external_state
+            
+            redirect_url = f"{external_redirect_uri}?{urlencode(params)}"
+            
+            # Log the callback for debugging
+            import logging
+            logger = logging.getLogger("terratunnel-server")
+            logger.info(f"OAuth proxy callback: redirecting to {redirect_url}")
+            
+            return RedirectResponse(url=redirect_url, status_code=302)
+            
+        except Exception as e:
+            # Handle errors by redirecting back with error parameters
+            from urllib.parse import urlencode
+            error_params = {
+                "error": "tunnel_creation_failed",
+                "error_description": f"Failed to create tunnel: {str(e)}"
+            }
+            if external_state:
+                error_params["state"] = external_state
+            
+            redirect_url = f"{external_redirect_uri}?{urlencode(error_params)}"
+            return RedirectResponse(url=redirect_url, status_code=302)
+    
+    elif redirect_uri:
+        # Normal browser-based auth - set cookie and redirect
         response = RedirectResponse(url=redirect_uri, status_code=302)
         response.set_cookie(
             key="auth_token",
