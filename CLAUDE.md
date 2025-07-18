@@ -344,7 +344,9 @@ TERRATUNNEL_DB_PATH=/data/terratunnel.db
 
 Terratunnel automatically handles large file transfers using a chunked streaming protocol:
 
-1. **Automatic Streaming**: Files larger than 10MB are automatically streamed in chunks
+1. **Automatic Streaming**: 
+   - Binary files larger than 10MB are automatically streamed in chunks
+   - Binary responses without Content-Length headers are always streamed (prevents loading unknown-size responses into memory)
 2. **Memory Efficient**: Only 512KB is held in memory at a time during transfers
 3. **Integrity Checking**: Each chunk includes SHA256 checksums for verification
 4. **Transparent**: The streaming is transparent to HTTP clients - they see normal responses
@@ -355,6 +357,11 @@ Terratunnel automatically handles large file transfers using a chunked streaming
 - File data is sent in separate chunk messages with checksums
 - Server reassembles chunks and verifies integrity before sending to HTTP client
 - Errors during streaming are handled gracefully with proper error messages
+
+**When streaming is used**:
+- Binary files larger than STREAMING_THRESHOLD (default: 10MB)
+- Binary responses without Content-Length header (to avoid memory issues with unknown-size responses)
+- Text files are never streamed (they use the regular text response path)
 
 **Configuration**:
 - `STREAMING_THRESHOLD`: Files larger than this use streaming (default: 10MB)

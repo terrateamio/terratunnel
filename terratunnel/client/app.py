@@ -409,14 +409,21 @@ class TunnelClient:
                     content_length = response.headers.get("content-length")
                     if content_length:
                         content_size = int(content_length)
+                        use_streaming = content_size > STREAMING_THRESHOLD
                     else:
-                        content_size = len(response.content)
+                        # No Content-Length header - always stream to avoid loading entire response
+                        logger.debug(f"[{request_id}] No Content-Length header, will use streaming")
+                        content_size = 0  # Unknown size
+                        use_streaming = True
                     
-                    logger.debug(f"[{request_id}] Response is binary, size: {content_size} bytes")
+                    logger.debug(f"[{request_id}] Response is binary, size: {content_size if content_size > 0 else 'unknown'} bytes")
                     
-                    # Use streaming for large files
-                    if content_size > STREAMING_THRESHOLD:
-                        logger.info(f"[{request_id}] Large response ({content_size} bytes > {STREAMING_THRESHOLD} threshold), using streaming")
+                    # Use streaming for large files or when size is unknown
+                    if use_streaming:
+                        if content_size > 0:
+                            logger.info(f"[{request_id}] Large response ({content_size} bytes > {STREAMING_THRESHOLD} threshold), using streaming")
+                        else:
+                            logger.info(f"[{request_id}] Response size unknown (no Content-Length header), using streaming")
                         
                         stream_id = str(uuid.uuid4())
                         logger.debug(f"[CLIENT-STREAM-INIT] Created stream ID: {stream_id}")
@@ -430,7 +437,7 @@ class TunnelClient:
                         response_data["is_streaming"] = True
                         response_data["stream"] = {
                             "id": stream_id,
-                            "total_size": content_size,
+                            "total_size": content_size if content_size > 0 else len(response.content),  # Use actual size if unknown
                             "content_type": content_type
                         }
                         
