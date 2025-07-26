@@ -365,6 +365,65 @@ async def execute_query(
         conn.close()
 
 
+@api_router.delete("/admin/db/users/{user_id}")
+async def delete_user(
+    user_id: int,
+    request: Request,
+    admin: dict = Depends(require_admin_cookie)
+):
+    """Delete a user and all associated data"""
+    db = get_database()
+    conn = sqlite3.connect(db.db_path)
+    cursor = conn.cursor()
+    
+    try:
+        # Begin transaction
+        cursor.execute("BEGIN TRANSACTION")
+        
+        # Check if user exists
+        cursor.execute("SELECT provider_username, auth_provider FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        username, provider = user
+        
+        # Delete in correct order due to foreign key constraints
+        # 1. Delete API keys
+        cursor.execute("DELETE FROM api_keys WHERE user_id = ?", (user_id,))
+        api_key_count = cursor.rowcount
+        
+        # 2. Delete tunnels
+        cursor.execute("DELETE FROM tunnels WHERE user_id = ?", (user_id,))
+        tunnel_count = cursor.rowcount
+        
+        # 3. Delete audit logs
+        cursor.execute("DELETE FROM tunnel_audit_log WHERE user_id = ?", (user_id,))
+        audit_count = cursor.rowcount
+        
+        # 4. Finally, delete the user
+        cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        
+        # Commit transaction
+        conn.commit()
+        
+        return {
+            "success": True,
+            "message": f"Deleted user {username} ({provider}) and all associated data",
+            "deleted": {
+                "api_keys": api_key_count,
+                "tunnels": tunnel_count,
+                "audit_logs": audit_count
+            }
+        }
+        
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete user: {str(e)}")
+    finally:
+        conn.close()
+
+
 @api_router.get("/admin/db/download")
 async def download_database(request: Request, admin: dict = Depends(require_admin_cookie)):
     """Download the entire database file"""

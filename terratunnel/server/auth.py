@@ -289,30 +289,23 @@ async def github_oauth_callback(
             # Check if user is admin
             is_admin = Config.is_admin_user("github", user["provider_username"])
             
-            # Create API key for the user
+            # Create API key for the user (this will also create a tunnel if needed)
             api_key = db.create_api_key(
                 user_id=user_id,
                 name=f"Terrateam Setup Wizard - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                is_admin=is_admin
+                is_admin=is_admin,
+                provider="github",  # We know this is GitHub from the OAuth flow
+                username=user["provider_username"]
             )
             
-            # Get user's tunnel information
-            tunnel_subdomain = user.get("tunnel_subdomain")
-            if not tunnel_subdomain:
-                # This shouldn't happen with current migration but handle it gracefully
-                # Generate a new subdomain and update the user record
-                import sqlite3
-                conn = sqlite3.connect(db.db_path)
-                cursor = conn.cursor()
-                try:
-                    tunnel_subdomain = db._generate_unique_subdomain(cursor)
-                    cursor.execute(
-                        "UPDATE users SET tunnel_subdomain = ? WHERE id = ?", 
-                        (tunnel_subdomain, user_id)
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
+            # Get the actual tunnel that was created/used for this API key
+            api_key_info = db.validate_api_key(api_key)
+            if api_key_info and api_key_info.get("tunnel_subdomain"):
+                tunnel_subdomain = api_key_info["tunnel_subdomain"]
+            else:
+                # Fallback - this shouldn't happen
+                logger.error(f"Could not get tunnel subdomain for API key")
+                raise Exception("Failed to get tunnel information")
             
             # Get the tunnel URL - extract domain from the Host header
             host = request.headers.get("host", "localhost")

@@ -389,31 +389,84 @@ class Database:
             conn.close()
     
     # Tunnel management methods
-    def create_tunnel(self, user_id: int, name: Optional[str] = None) -> Dict:
-        """Create a new tunnel for a user"""
+    def create_tunnel(self, user_id: int, provider: Optional[str] = None, username: Optional[str] = None) -> Dict:
+        """Create a new tunnel for a user
+        
+        Args:
+            user_id: The user's ID
+            provider: Auth provider (github, gitlab, google) - needed to check admin status
+            username: Username - needed to check admin status
+            
+        For non-admin users, this enforces a single tunnel limit.
+        Tunnel names are auto-generated and cannot be customized by users.
+        """
         conn = sqlite3.connect(self.db_path)
+        # Enable WAL mode for better concurrency
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Use EXCLUSIVE transaction to prevent race conditions
+        conn.isolation_level = 'EXCLUSIVE'
         cursor = conn.cursor()
         
         try:
+            # Begin exclusive transaction
+            cursor.execute("BEGIN EXCLUSIVE")
+            
+            # Check if user is admin (if provider and username are provided)
+            is_admin = False
+            if provider and username:
+                from .config import Config
+                is_admin = Config.is_admin_user(provider, username)
+            
+            # For non-admin users, check if they already have a tunnel
+            if not is_admin:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM tunnels 
+                    WHERE user_id = ? AND is_active = 1
+                """, (user_id,))
+                tunnel_count = cursor.fetchone()[0]
+                
+                if tunnel_count > 0:
+                    # Non-admin user already has a tunnel, return the existing one
+                    cursor.execute("""
+                        SELECT id, subdomain, name 
+                        FROM tunnels 
+                        WHERE user_id = ? AND is_active = 1
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                    """, (user_id,))
+                    existing_tunnel = cursor.fetchone()
+                    
+                    logger.info(f"     Non-admin user {user_id} already has a tunnel, returning existing tunnel {existing_tunnel[0]}")
+                    
+                    return {
+                        "id": existing_tunnel[0],
+                        "subdomain": existing_tunnel[1],
+                        "name": existing_tunnel[2]
+                    }
+            
             # Generate unique subdomain
             subdomain = self._generate_unique_subdomain(cursor)
+            
+            # Auto-generate name based on subdomain
+            tunnel_name = f"Tunnel {subdomain}"
             
             cursor.execute("""
                 INSERT INTO tunnels (user_id, subdomain, name)
                 VALUES (?, ?, ?)
-            """, (user_id, subdomain, name or f"Tunnel {subdomain}"))
+            """, (user_id, subdomain, tunnel_name))
             
             tunnel_id = cursor.lastrowid
             conn.commit()
             
-            logger.info(f"     Created tunnel {tunnel_id} for user {user_id}: {subdomain}")
+            logger.info(f"     Created tunnel {tunnel_id} for user {user_id}: {subdomain} (admin: {is_admin})")
             
             return {
                 "id": tunnel_id,
                 "subdomain": subdomain,
-                "name": name or f"Tunnel {subdomain}"
+                "name": tunnel_name
             }
         except Exception as e:
+            conn.rollback()
             logger.error(f"     Failed to create tunnel: {e}")
             raise
         finally:
@@ -507,14 +560,25 @@ class Database:
             conn.close()
     
     def create_api_key(self, user_id: int, name: Optional[str] = None, 
-                      expires_at: Optional[datetime] = None, scopes: str = "tunnel:create", is_admin: bool = False) -> str:
-        """Legacy method - creates API key for user's default tunnel"""
+                      expires_at: Optional[datetime] = None, scopes: str = "tunnel:create", 
+                      is_admin: bool = False, provider: Optional[str] = None, username: Optional[str] = None) -> str:
+        """Legacy method - creates API key for user's default tunnel
+        
+        Args:
+            user_id: The user's ID
+            name: Optional name for the API key
+            expires_at: Optional expiration datetime
+            scopes: API key scopes
+            is_admin: Whether the user is an admin (deprecated, use provider/username)
+            provider: Auth provider for admin check
+            username: Username for admin check
+        """
         # Get user's tunnels
         tunnels = self.list_user_tunnels(user_id)
         
         if not tunnels:
             # No tunnel exists, create one
-            tunnel = self.create_tunnel(user_id, "Default tunnel")
+            tunnel = self.create_tunnel(user_id, provider=provider, username=username)
             tunnel_id = tunnel["id"]
         else:
             # Use the first (default) tunnel
