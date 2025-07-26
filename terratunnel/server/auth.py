@@ -48,19 +48,33 @@ def generate_state() -> str:
     return state
 
 
-def verify_state(state: str) -> bool:
-    """Verify OAuth state parameter"""
+def verify_state(state: str, delete: bool = True) -> bool:
+    """Verify OAuth state parameter
+    
+    Args:
+        state: The state parameter to verify
+        delete: Whether to delete the state after verification (default: True)
+    """
     if state not in oauth_states:
+        import logging
+        logger = logging.getLogger("terratunnel-server")
+        logger.warning(f"State not found in oauth_states: {state}")
+        logger.warning(f"Available states: {list(oauth_states.keys())}")
         return False
     
     # Check if state is not too old (10 minutes max)
     created_at = oauth_states[state]
-    if datetime.now(timezone.utc) - created_at > timedelta(minutes=10):
-        del oauth_states[state]
-        return False
+    if isinstance(created_at, datetime):
+        if datetime.now(timezone.utc) - created_at > timedelta(minutes=10):
+            del oauth_states[state]
+            import logging
+            logger = logging.getLogger("terratunnel-server")
+            logger.warning(f"State expired (older than 10 minutes): {state}")
+            return False
     
-    # State is valid, remove it (one-time use)
-    del oauth_states[state]
+    # State is valid, optionally remove it (one-time use)
+    if delete:
+        del oauth_states[state]
     return True
 
 
@@ -106,8 +120,14 @@ async def github_oauth_authorize_proxy(
     if not Config.has_github_oauth():
         raise HTTPException(status_code=503, detail="GitHub OAuth not configured")
     
+    # Log the incoming request
+    import logging
+    logger = logging.getLogger("terratunnel-server")
+    logger.info(f"OAuth proxy request: redirect_uri={redirect_uri}, external_state={state}")
+    
     # Store the external redirect URI and state for later
     internal_state = generate_state()
+    logger.info(f"Generated internal state: {internal_state}")
     
     # Store both the external redirect_uri and external state
     oauth_states[f"{internal_state}_external_redirect"] = redirect_uri
@@ -143,6 +163,11 @@ async def github_oauth_callback(
     error_description: Optional[str] = None
 ):
     """Handle OAuth callback from GitHub"""
+    # Log the callback
+    import logging
+    logger = logging.getLogger("terratunnel-server")
+    logger.info(f"OAuth callback received: code={code[:10] if code else None}..., state={state}, error={error}")
+    
     # Check for OAuth errors first
     if error:
         # Check if this is an external OAuth proxy request that had an error
@@ -173,8 +198,8 @@ async def github_oauth_callback(
                 error_msg += f" - {error_description}"
             raise HTTPException(status_code=400, detail=error_msg)
     
-    # Verify state parameter
-    if not verify_state(state):
+    # Verify state parameter (don't delete yet, we need it for external redirect info)
+    if not verify_state(state, delete=False):
         raise HTTPException(status_code=400, detail="Invalid or expired state parameter")
     
     # Exchange code for access token
@@ -254,6 +279,9 @@ async def github_oauth_callback(
     # Check if this is an external OAuth proxy request (from /auth/github/authorize)
     external_redirect_uri = oauth_states.pop(f"{state}_external_redirect", None)
     external_state = oauth_states.pop(f"{state}_external_state", None)
+    
+    # Now we can safely delete the state since we've retrieved all associated data
+    oauth_states.pop(state, None)
     
     if external_redirect_uri:
         # This is from the OAuth proxy - create tunnel and redirect back with all data
