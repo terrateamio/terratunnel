@@ -878,6 +878,21 @@ async def admin_database_browser(request: Request, user: dict = Depends(get_curr
             .button.secondary:hover {{
                 background: #555;
             }}
+            .button-danger {{
+                display: inline-block;
+                padding: 10px 20px;
+                background: #dc2626;
+                color: white;
+                text-decoration: none;
+                border-radius: 5px;
+                font-weight: 500;
+                border: none;
+                cursor: pointer;
+                font-size: 14px;
+            }}
+            .button-danger:hover {{
+                background: #b91c1c;
+            }}
             .card {{
                 background: white;
                 border-radius: 8px;
@@ -1132,6 +1147,10 @@ async def admin_database_browser(request: Request, user: dict = Depends(get_curr
                 data.columns.forEach(col => {{
                     html += `<th>${{col}}</th>`;
                 }});
+                // Add Actions column for users table
+                if (currentTable === 'users') {{
+                    html += '<th>Actions</th>';
+                }}
                 html += '</tr></thead>';
                 
                 // Body
@@ -1147,11 +1166,20 @@ async def admin_database_browser(request: Request, user: dict = Depends(get_curr
                         }}
                         html += `<td>${{value}}</td>`;
                     }});
+                    // Add delete button for users table
+                    if (currentTable === 'users' && row.id) {{
+                        html += `<td>
+                            <button class="button-danger" onclick="deleteUser(${{row.id}}, '${{row.provider_username}}', '${{row.auth_provider}}')" 
+                                    style="padding: 5px 10px; font-size: 12px;">
+                                Delete
+                            </button>
+                        </td>`;
+                    }}
                     html += '</tr>';
                 }});
                 
                 if (data.rows.length === 0) {{
-                    html += '<tr><td colspan="' + data.columns.length + '" style="text-align: center; color: #666;">No data found</td></tr>';
+                    html += '<tr><td colspan="' + (data.columns.length + (currentTable === 'users' ? 1 : 0)) + '" style="text-align: center; color: #666;">No data found</td></tr>';
                 }}
                 
                 html += '</tbody></table></div>';
@@ -1241,6 +1269,32 @@ async def admin_database_browser(request: Request, user: dict = Depends(get_curr
             function clearQuery() {{
                 document.getElementById('queryInput').value = '';
                 document.getElementById('queryResult').innerHTML = '';
+            }}
+            
+            async function deleteUser(userId, username, provider) {{
+                if (!confirm(`Are you sure you want to delete user '${{username}}' (${{provider}}) and all associated data?\\n\\nThis will delete:\\n- All API keys\\n- All tunnels\\n- All audit logs\\n\\nThis action cannot be undone!`)) {{
+                    return;
+                }}
+                
+                try {{
+                    const response = await fetch(`/api/admin/db/users/${{userId}}`, {{
+                        method: 'DELETE',
+                        credentials: 'include'
+                    }});
+                    
+                    const data = await response.json();
+                    
+                    if (!response.ok) {{
+                        throw new Error(data.detail || 'Delete failed');
+                    }}
+                    
+                    alert(`Successfully deleted user '${{username}}'\\n\\nDeleted:\\n- ${{data.deleted.api_keys}} API keys\\n- ${{data.deleted.tunnels}} tunnels\\n- ${{data.deleted.audit_logs}} audit logs`);
+                    
+                    // Reload the table
+                    loadTable('users', currentPage);
+                }} catch (error) {{
+                    alert('Error deleting user: ' + error.message);
+                }}
             }}
             
             function getCookie(name) {{
@@ -1804,13 +1858,13 @@ async def create_tunnel(request: Request, auth_token: Optional[str] = Cookie(Non
     if not is_admin_user(user):
         raise HTTPException(status_code=403, detail="Only administrators can create new tunnels")
     
-    # Get form data
-    form_data = await request.form()
-    tunnel_name = form_data.get("name", "").strip() or None
-    
-    # Create tunnel
+    # Create tunnel (no longer accepting user-provided names)
     if db:
-        tunnel = db.create_tunnel(user["id"], tunnel_name)
+        tunnel = db.create_tunnel(
+            user["id"], 
+            provider=user["provider"], 
+            username=user["username"]
+        )
         return RedirectResponse(url=f"/?tunnel_created={tunnel['subdomain']}", status_code=302)
     
     raise HTTPException(status_code=500, detail="Failed to create tunnel")
