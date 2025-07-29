@@ -236,52 +236,67 @@ class ConnectionManager:
         """Handle incoming stream chunk."""
         stream_id = message.get("stream_id")
         
-        logger.debug(f"[SERVER-STREAM] handle_stream_chunk called for stream {stream_id} from subdomain {subdomain}")
-        logger.debug(f"[SERVER-STREAM] Message keys: {list(message.keys())}")
-        logger.debug(f"[SERVER-STREAM] Chunk data keys: {list(message.get('chunk', {}).keys())}")
+        logger.info(f"[SERVER-STREAM] handle_stream_chunk called for stream {stream_id} from subdomain {subdomain}")
+        logger.info(f"[SERVER-STREAM] Message keys: {list(message.keys())}")
+        chunk_data = message.get('chunk', {})
+        logger.info(f"[SERVER-STREAM] Chunk data: index={chunk_data.get('index')}, total={chunk_data.get('total')}, size={chunk_data.get('size')}, checksum={chunk_data.get('checksum', '')[:8]}...")
         
         # Find the stream receiver
         receiver = None
         receiver_key = None
         with self.lock:
-            logger.debug(f"[SERVER-STREAM] Looking for receiver for stream {stream_id} from subdomain {subdomain}")
-            logger.debug(f"[SERVER-STREAM] Active receivers: {list(self.stream_receivers.keys())}")
+            logger.info(f"[SERVER-STREAM] Looking for receiver for stream {stream_id} from subdomain {subdomain}")
+            logger.info(f"[SERVER-STREAM] Active receivers: {list(self.stream_receivers.keys())}")
             for recv_id, recv in self.stream_receivers.items():
-                logger.debug(f"[SERVER-STREAM] Checking receiver {recv_id}, active streams: {list(recv.active_streams.keys())}")
+                logger.info(f"[SERVER-STREAM] Checking receiver {recv_id}, active streams: {list(recv.active_streams.keys())}")
                 if recv_id.startswith(f"{subdomain}:") and stream_id in recv.active_streams:
                     receiver = recv
                     receiver_key = recv_id
-                    logger.debug(f"[SERVER-STREAM] Found matching receiver!")
+                    logger.info(f"[SERVER-STREAM] Found matching receiver {recv_id} for stream {stream_id}!")
                     break
         
         if receiver:
-            logger.debug(f"[SERVER-STREAM] Found receiver {receiver_key} for stream {stream_id}")
+            logger.info(f"[SERVER-STREAM] Processing chunk with receiver {receiver_key}")
             
             # Let receiver handle the chunk
-            receiver.handle_chunk(message)
+            try:
+                chunk_bytes = await receiver.handle_chunk(message)
+                if chunk_bytes:
+                    logger.info(f"[SERVER-STREAM] Receiver processed chunk successfully, got {len(chunk_bytes)} bytes")
+                else:
+                    logger.error(f"[SERVER-STREAM] Receiver.handle_chunk returned None!")
+            except Exception as e:
+                logger.error(f"[SERVER-STREAM] Error in receiver.handle_chunk: {e}", exc_info=True)
             
             # Check if we have a stream handler
             stream_handler = getattr(receiver, 'stream_handler', None)
             if stream_handler:
+                logger.info(f"[SERVER-STREAM] Found stream_handler on receiver, forwarding chunk")
                 # Forward decoded chunk to handler
                 chunk_data = message.get("chunk", {})
                 if chunk_data.get("data"):
                     try:
                         decoded_data = base64.b64decode(chunk_data["data"])
+                        logger.info(f"[SERVER-STREAM] Decoded chunk data: {len(decoded_data)} bytes")
                         await stream_handler.add_chunk(decoded_data)
-                        logger.debug(f"[SERVER-STREAM] Added chunk to stream handler")
+                        logger.info(f"[SERVER-STREAM] Successfully added chunk to stream handler")
                     except Exception as e:
-                        logger.error(f"Error decoding chunk: {e}")
+                        logger.error(f"[SERVER-STREAM] Error decoding/handling chunk: {e}", exc_info=True)
                         await stream_handler.error(str(e))
+                else:
+                    logger.error(f"[SERVER-STREAM] No data in chunk!")
+            else:
+                logger.warning(f"[SERVER-STREAM] No stream_handler found on receiver!")
         else:
-            logger.warning(f"[SERVER-STREAM] No receiver found for stream {stream_id} from subdomain {subdomain}")
+            logger.error(f"[SERVER-STREAM] NO RECEIVER FOUND for stream {stream_id} from subdomain {subdomain}")
+            logger.error(f"[SERVER-STREAM] This will cause timeout errors!")
     
     async def handle_stream_complete(self, subdomain: str, message: dict):
         """Handle stream completion."""
         stream_id = message.get("stream_id")
         
-        logger.debug(f"[SERVER-STREAM] handle_stream_complete called for stream {stream_id} from subdomain {subdomain}")
-        logger.debug(f"[SERVER-STREAM] Completion message: {message}")
+        logger.info(f"[SERVER-STREAM] handle_stream_complete called for stream {stream_id} from subdomain {subdomain}")
+        logger.info(f"[SERVER-STREAM] Completion checksum: {message.get('checksum', 'N/A')}")
         
         # Find the stream receiver
         receiver = None
@@ -449,12 +464,15 @@ class ConnectionManager:
                 # Still need to set up receiver for chunk handling
                 if stream_id:
                     receiver_key = f"{subdomain}:{request_id}"
+                    logger.info(f"[SERVER-INIT] Creating/finding receiver with key: {receiver_key}")
                     with self.lock:
                         if receiver_key not in self.stream_receivers:
+                            logger.info(f"[SERVER-INIT] Creating new StreamReceiver for {receiver_key}")
                             self.stream_receivers[receiver_key] = StreamReceiver()
                         receiver = self.stream_receivers[receiver_key]
                         # Link handler to receiver
                         self.stream_receivers[receiver_key].stream_handler = stream_handler
+                        logger.info(f"[SERVER-INIT] Linked stream_handler to receiver {receiver_key}")
                     
                     # Initialize the stream
                     metadata = StreamMetadata(
@@ -466,6 +484,13 @@ class ConnectionManager:
                     )
                     receiver.start_stream(metadata, None)
                     receiver.active_streams[stream_id]["receiver_key"] = receiver_key
+                    logger.info(f"[SERVER-INIT] Started stream {stream_id} on receiver {receiver_key}")
+                    logger.info(f"[SERVER-INIT] Receiver now has active streams: {list(receiver.active_streams.keys())}")
+                    
+                    # Log all receivers state
+                    with self.lock:
+                        logger.info(f"[SERVER-INIT] All active receivers after init: {list(self.stream_receivers.keys())}")
+                    
                     logger.info(f"[{request_id}] Started streaming response for stream {stream_id}")
             else:
                 # Non-streaming response - set it directly
@@ -750,13 +775,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 if message_type == "keepalive_ack":
                     continue
                 elif message_type == "stream_chunk":
-                    logger.debug(f"[SERVER-WS] Handling stream_chunk message")
+                    logger.info(f"[SERVER-WS] Received stream_chunk message from {subdomain}")
+                    stream_id = message.get("stream_id", "unknown")
+                    chunk_info = message.get("chunk", {})
+                    logger.info(f"[SERVER-WS] Chunk info: stream_id={stream_id}, index={chunk_info.get('index')}, size={chunk_info.get('size')}")
                     # Handle streaming chunk
                     await manager.handle_stream_chunk(subdomain, message)
                     continue
                 elif message_type == "stream_complete":
                     # Handle stream completion
-                    logger.debug(f"Received stream_complete message: {message}")
+                    logger.info(f"[SERVER-WS] Received stream_complete message from {subdomain}: stream_id={message.get('stream_id')}, checksum={message.get('checksum', 'N/A')[:8]}...")
                     await manager.handle_stream_complete(subdomain, message)
                     continue
                 elif message_type == "stream_error":

@@ -138,11 +138,11 @@ class ChunkedStreamer:
             await asyncio.sleep(0)
         
         final_checksum = file_hasher.hexdigest()
-        logger.debug(f"[STREAMING] All chunks sent. Final file checksum: {final_checksum}")
+        logger.info(f"[STREAMING] All chunks created. Final file checksum: {final_checksum}")
         
         # Yield completion message
         complete_msg = StreamMessage.complete(stream_id, final_checksum)
-        logger.debug(f"[STREAMING] Yielding completion message: {complete_msg}")
+        logger.info(f"[STREAMING] Yielding completion message for stream {stream_id} with checksum {final_checksum}")
         yield complete_msg
     
     async def stream_response(self, response, stream_id: str) -> AsyncIterator[dict]:
