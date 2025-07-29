@@ -38,6 +38,16 @@ docker run --rm ghcr.io/terrateamio/terratunnel:latest server --help
 docker run --rm ghcr.io/terrateamio/terratunnel:latest client --help
 ```
 
+### Linting
+```bash
+# Install flake8
+pip install flake8
+
+# Run linting (same as CI pipeline)
+flake8 terratunnel --count --select=E9,F63,F7,F82 --show-source --statistics
+flake8 terratunnel --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+```
+
 ### Database Management
 ```bash
 # Connect to SQLite database
@@ -82,7 +92,7 @@ fly volumes create terratunnel_data --size 1
 - Version tags: Created for git tags (e.g., `v1.0.0`)
 - Multi-platform builds: linux/amd64 and linux/arm64
 
-The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
+The Docker publish workflow (`.github/workflows/publish.yml`) runs on:
 - Pushes to main branch
 - Git tags
 - Pull requests (build only, no push)
@@ -96,10 +106,10 @@ The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
 
 1. **Server Component** (`terratunnel/server/app.py`)
    - FastAPI-based server handling WebSocket connections
-   - OAuth2 authentication (GitHub, GitLab, Google)
+   - OAuth2 authentication (GitHub, GitLab)
    - SQLite database for user management and audit logging
    - Static tunnel URLs per user (e.g., `happy-panda-dancing.yourdomain.com`)
-   - One active API key per user with rotation capability
+   - One active API key per tunnel with rotation capability
    - Thread-safe connection management with locks
    - Middleware-based subdomain routing
    - Admin dashboard for tunnel monitoring
@@ -119,7 +129,7 @@ The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
 
 4. **Database Layer** (`terratunnel/server/database.py`)
    - SQLite with foreign key constraints
-   - Tables: users, api_keys, tunnel_audit_log
+   - Tables: users, api_keys, tunnels, tunnel_audit_log
    - Automatic migrations on startup
    - Human-readable subdomain generation using coolname library
 
@@ -135,7 +145,7 @@ The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
 
 ### Authentication Flow
 
-1. **OAuth Login**: User visits `/auth/login` → GitHub OAuth → Callback → JWT session
+1. **OAuth Login**: User visits `/auth/login` → GitHub/GitLab OAuth → Callback → JWT session
 2. **API Key Generation**: Authenticated user generates API key (replaces any existing key)
 3. **Client Connection**: Client connects with API key in Authorization header
 4. **Tunnel Creation**: Server assigns user's static subdomain to the tunnel
@@ -148,7 +158,7 @@ The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
 - **Environment-First Config**: All options configurable via environment variables
 - **Modular Architecture**: Clear separation between server, client, and CLI layers
 - **Static Tunnels**: Each user gets one permanent subdomain regardless of API key changes
-- **Single API Key**: Users limited to one active API key at a time with rotation
+- **Single API Key**: Users limited to one active API key per tunnel at a time with rotation
 
 ### Important Routes and Endpoints
 
@@ -156,18 +166,17 @@ The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
 1. `/ws` - WebSocket endpoint for tunnel clients
 2. `/_health` - Health check endpoint (no auth required)
 3. `/auth/login` - OAuth login page
-4. `/auth/{provider}` - OAuth provider redirect (github, gitlab, google)
+4. `/auth/{provider}` - OAuth provider redirect (github, gitlab)
 5. `/auth/{provider}/callback` - OAuth callback handlers
 6. `/api/auth/exchange` - Exchange OAuth token for API key
 7. `/api/auth/me` - Get current user info
 8. `/api/auth/keys` - List user's API keys
 9. `/api/auth/keys/{key_id}` - Revoke API key
-10. `/_admin` - Admin dashboard (OAuth protected, admin users only)
-11. `/_admin/api/tunnels` - Admin API for active tunnels
-12. `/_admin/api/audit` - Admin API for audit logs
-13. `/` - Home page with login
-14. `/dashboard` - User dashboard for API key management
-15. `/{path:path}` - Catch-all proxy route (handles subdomain requests)
+10. `/admin/database` - Database browser (admin only)
+11. `/` - Home page with login/dashboard
+12. `/tunnels/new` - Create new tunnel (admin only)
+13. `/tunnels/{tunnel_id}/keys/new` - Generate/rotate API key for tunnel
+14. `/{path:path}` - Catch-all proxy route (handles subdomain requests)
 
 **Client Routes** (when dashboard enabled):
 - Dashboard on port 8080: `/`, `/api/webhooks`, `/api/status`
@@ -175,7 +184,7 @@ The Docker publish workflow (`.github/workflows/docker-publish.yml`) runs on:
 
 ### Security Features
 
-- **OAuth2 Authentication**: Support for GitHub, GitLab, and Google
+- **OAuth2 Authentication**: Support for GitHub and GitLab
 - **JWT Sessions**: Secure session management with configurable expiration
 - **API Key Authentication**: Bearer token authentication for programmatic access
 - **Admin Access Control**: Restricted to users in TERRATUNNEL_{PROVIDER}_ADMIN_USERS
@@ -255,15 +264,19 @@ CREATE TABLE tunnel_audit_log (
 
 Required for production:
 ```bash
-# OAuth credentials
+# OAuth credentials (at least one provider required)
 GITHUB_CLIENT_ID=your_github_client_id
 GITHUB_CLIENT_SECRET=your_github_client_secret
+
+GITLAB_CLIENT_ID=your_gitlab_client_id
+GITLAB_CLIENT_SECRET=your_gitlab_client_secret
 
 # Security
 JWT_SECRET=your_secure_secret_key  # Generate with: openssl rand -hex 32
 
 # Admin users (comma-separated)
 TERRATUNNEL_GITHUB_ADMIN_USERS=username1,username2
+TERRATUNNEL_GITLAB_ADMIN_USERS=username1,username2
 
 # Database (for Fly.io deployment)
 TERRATUNNEL_DB_PATH=/data/terratunnel.db
@@ -290,20 +303,20 @@ TERRATUNNEL_DB_PATH=/data/terratunnel.db
    - Adjust limits with TERRATUNNEL_MAX_REQUEST_SIZE and TERRATUNNEL_MAX_RESPONSE_SIZE
    - WebSocket message size limit is 512MB to accommodate chunked transfers
 
-2. **Client authentication failures**
+3. **Client authentication failures**
    - Ensure API key is in Authorization header: `Authorization: Bearer your_key`
    - Check that API key is active in database
 
-3. **Subdomain routing returns 404**
+4. **Subdomain routing returns 404**
    - Verify user has tunnel_subdomain assigned in database
    - Check that tunnel is active in connected_tunnels dict
    - Ensure hostname normalization (lowercase) is consistent
 
-4. **Admin access issues**
+5. **Admin access issues**
    - Verify username is in TERRATUNNEL_{PROVIDER}_ADMIN_USERS
    - Check JWT token expiration
 
-5. **Fly.io deployment issues**
+6. **Fly.io deployment issues**
    - Ensure volume is mounted at /data for persistent storage
    - Check that TERRATUNNEL_DB_PATH points to /data/terratunnel.db
    - Verify secrets are set: fly secrets list
@@ -368,7 +381,7 @@ Terratunnel automatically handles large file transfers using a chunked streaming
 - `DEFAULT_CHUNK_SIZE`: Size of each chunk (default: 512KB)
 - `TERRATUNNEL_MAX_RESPONSE_SIZE`: Maximum file size before returning 413 error (default: 50MB)
 
-### Recent Changes (July 2025)
+### Recent Changes (2024-2025)
 
 1. **Static Tunnel URLs**: Each user now gets a permanent subdomain (e.g., `gentle-tiger-swimming.yourdomain.com`) that doesn't change when API keys are rotated.
 
@@ -396,9 +409,9 @@ Terratunnel automatically handles large file transfers using a chunked streaming
    - WebSocket message size increased to 512MB to support large transfers
 
 8. **Admin Features Update**:
-   - Removed separate admin dashboard at /_admin  
-   - Integrated admin features into main dashboard at /
+   - Admin dashboard accessible at root path for admin users
    - Admin dashboard shows all active tunnels and recent connections
+   - Database browser at `/admin/database` for direct SQL access
 
 9. **Tunnel-Based Architecture** (December 2024):
    - Introduced proper `tunnels` table in database
@@ -412,7 +425,20 @@ Terratunnel automatically handles large file transfers using a chunked streaming
      - Dashboard shows all user's tunnels
      - Each tunnel has "Generate/Rotate API Key" button
      - Admin users see "Create New Tunnel" button
-   - Routes added:
-     - `/tunnels/new` - Create new tunnel (admin only)
-     - `/tunnels/{tunnel_id}/keys/new` - Generate/rotate API key for tunnel
    - Database migration automatically moves existing data to new structure
+   - New users get automatic tunnel creation on first login
+
+10. **GitLab OAuth Support** (July 2025):
+    - Added GitLab as an OAuth provider alongside GitHub
+    - Configure with `GITLAB_CLIENT_ID` and `GITLAB_CLIENT_SECRET`
+    - Admin users configured via `TERRATUNNEL_GITLAB_ADMIN_USERS`
+    - Redirect URI: `https://yourdomain.com/auth/gitlab/callback`
+    - Required scope: `read_user`
+
+# important-instruction-reminders
+Do what has been asked; nothing more, nothing less.
+NEVER create files unless they're absolutely necessary for achieving your goal.
+ALWAYS prefer editing an existing file to creating a new one.
+NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.
+
+IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.

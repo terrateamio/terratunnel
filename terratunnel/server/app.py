@@ -1773,12 +1773,28 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
                 
                 <p>Sign in to get started with your API key.</p>
                 
-                <a href="/auth/github?redirect_uri=/" class="github-button">
-                    <svg height="20" width="20" viewBox="0 0 16 16" fill="white">
-                        <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
-                    </svg>
-                    Sign in with GitHub
-                </a>
+                <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">"""
+        
+        if Config.has_github_oauth():
+            html += """
+                    <a href="/auth/github?redirect_uri=/" class="github-button">
+                        <svg height="20" width="20" viewBox="0 0 16 16" fill="white">
+                            <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+                        </svg>
+                        Sign in with GitHub
+                    </a>"""
+        
+        if Config.has_gitlab_oauth():
+            html += """
+                    <a href="/auth/gitlab?redirect_uri=/" class="gitlab-button" style="background: #FC6D26; display: inline-flex; align-items: center; gap: 10px; padding: 12px 24px; color: white; border: none; border-radius: 6px; text-decoration: none; font-size: 16px; margin-top: 20px; cursor: pointer;">
+                        <svg height="20" width="20" viewBox="0 0 24 24" fill="white">
+                            <path d="M23.6 9.593l-.033-.086L20.3.98a.851.851 0 00-.336-.405.875.875 0 00-1.073.174.875.875 0 00-.2.395l-2.18 6.7H7.495l-2.18-6.7a.875.875 0 00-.2-.395.875.875 0 00-1.073-.174.851.851 0 00-.336.405L.437 9.506l-.032.086a6.066 6.066 0 002.27 7.202l.004.003.01.008 4.988 3.73 2.462 1.862 1.5 1.134a1.008 1.008 0 001.22 0l1.5-1.134 2.462-1.862 4.997-3.739.01-.008a6.068 6.068 0 002.263-7.196z"/>
+                        </svg>
+                        Sign in with GitLab
+                    </a>"""
+        
+        html += """
+                </div>
             </div>
         </body>
         </html>
@@ -1795,7 +1811,7 @@ async def new_tunnel_page(request: Request, auth_token: Optional[str] = Cookie(N
     
     user = await get_current_user_from_cookie(request, auth_token)
     if not user:
-        return RedirectResponse(url="/auth/github?redirect_uri=/tunnels/new", status_code=302)
+        return RedirectResponse(url="/auth/login?redirect_uri=/tunnels/new", status_code=302)
     
     # Check if user is admin
     if not is_admin_user(user):
@@ -1878,7 +1894,7 @@ async def new_tunnel_api_key_page(tunnel_id: int, request: Request, auth_token: 
     
     user = await get_current_user_from_cookie(request, auth_token)
     if not user:
-        return RedirectResponse(url=f"/auth/github?redirect_uri=/tunnels/{tunnel_id}/keys/new", status_code=302)
+        return RedirectResponse(url=f"/auth/login?redirect_uri=/tunnels/{tunnel_id}/keys/new", status_code=302)
     
     # Verify user owns this tunnel
     if db:
@@ -1998,7 +2014,7 @@ async def new_api_key_page(request: Request, auth_token: Optional[str] = Cookie(
     
     user = await get_current_user_from_cookie(request, auth_token)
     if not user:
-        return RedirectResponse(url="/auth/github?redirect_uri=/api/keys/new", status_code=302)
+        return RedirectResponse(url="/auth/login?redirect_uri=/api/keys/new", status_code=302)
     
     # Check if user already has an API key
     has_api_key = False
@@ -2170,7 +2186,7 @@ async def generate_api_key(request: Request, auth_token: Optional[str] = Cookie(
     
     user = await get_current_user_from_cookie(request, auth_token)
     if not user:
-        return RedirectResponse(url="/auth/github?redirect_uri=/api/keys/new", status_code=302)
+        return RedirectResponse(url="/auth/login?redirect_uri=/api/keys/new", status_code=302)
     
     # Get form data
     form_data = await request.form()
@@ -2349,7 +2365,7 @@ async def revoke_api_key(key_id: int, request: Request, auth_token: Optional[str
     
     user = await get_current_user_from_cookie(request, auth_token)
     if not user:
-        return RedirectResponse(url="/auth/github?redirect_uri=/", status_code=302)
+        return RedirectResponse(url="/auth/login?redirect_uri=/", status_code=302)
     
     if db:
         # Verify the key belongs to the user and revoke it
