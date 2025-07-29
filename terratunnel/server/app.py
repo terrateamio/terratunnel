@@ -236,34 +236,24 @@ class ConnectionManager:
         """Handle incoming stream chunk."""
         stream_id = message.get("stream_id")
         
-        logger.info(f"[SERVER-STREAM] handle_stream_chunk called for stream {stream_id} from subdomain {subdomain}")
-        logger.info(f"[SERVER-STREAM] Message keys: {list(message.keys())}")
         chunk_data = message.get('chunk', {})
-        logger.info(f"[SERVER-STREAM] Chunk data: index={chunk_data.get('index')}, total={chunk_data.get('total')}, size={chunk_data.get('size')}, checksum={chunk_data.get('checksum', '')[:8]}...")
         
         # Find the stream receiver
         receiver = None
         receiver_key = None
         with self.lock:
-            logger.info(f"[SERVER-STREAM] Looking for receiver for stream {stream_id} from subdomain {subdomain}")
-            logger.info(f"[SERVER-STREAM] Active receivers: {list(self.stream_receivers.keys())}")
             for recv_id, recv in self.stream_receivers.items():
-                logger.info(f"[SERVER-STREAM] Checking receiver {recv_id}, active streams: {list(recv.active_streams.keys())}")
                 if recv_id.startswith(f"{subdomain}:") and stream_id in recv.active_streams:
                     receiver = recv
                     receiver_key = recv_id
-                    logger.info(f"[SERVER-STREAM] Found matching receiver {recv_id} for stream {stream_id}!")
                     break
         
         if receiver:
-            logger.info(f"[SERVER-STREAM] Processing chunk with receiver {receiver_key}")
             
             # Let receiver handle the chunk
             try:
                 chunk_bytes = await receiver.handle_chunk(message)
-                if chunk_bytes:
-                    logger.info(f"[SERVER-STREAM] Receiver processed chunk successfully, got {len(chunk_bytes)} bytes")
-                else:
+                if not chunk_bytes:
                     logger.error(f"[SERVER-STREAM] Receiver.handle_chunk returned None!")
             except Exception as e:
                 logger.error(f"[SERVER-STREAM] Error in receiver.handle_chunk: {e}", exc_info=True)
@@ -271,15 +261,12 @@ class ConnectionManager:
             # Check if we have a stream handler
             stream_handler = getattr(receiver, 'stream_handler', None)
             if stream_handler:
-                logger.info(f"[SERVER-STREAM] Found stream_handler on receiver, forwarding chunk")
                 # Forward decoded chunk to handler
                 chunk_data = message.get("chunk", {})
                 if chunk_data.get("data"):
                     try:
                         decoded_data = base64.b64decode(chunk_data["data"])
-                        logger.info(f"[SERVER-STREAM] Decoded chunk data: {len(decoded_data)} bytes")
                         await stream_handler.add_chunk(decoded_data)
-                        logger.info(f"[SERVER-STREAM] Successfully added chunk to stream handler")
                     except Exception as e:
                         logger.error(f"[SERVER-STREAM] Error decoding/handling chunk: {e}", exc_info=True)
                         await stream_handler.error(str(e))
@@ -295,19 +282,13 @@ class ConnectionManager:
         """Handle stream completion."""
         stream_id = message.get("stream_id")
         
-        logger.info(f"[SERVER-STREAM] handle_stream_complete called for stream {stream_id} from subdomain {subdomain}")
-        logger.info(f"[SERVER-STREAM] Completion checksum: {message.get('checksum', 'N/A')}")
         
         # Find the stream receiver
         receiver = None
         with self.lock:
-            logger.debug(f"[SERVER-STREAM] Looking for receiver for completed stream {stream_id}")
-            logger.debug(f"[SERVER-STREAM] Available receivers: {list(self.stream_receivers.keys())}")
             for recv_id, recv in self.stream_receivers.items():
-                logger.debug(f"[SERVER-STREAM] Checking receiver {recv_id}, active streams: {list(recv.active_streams.keys())}")
                 if recv_id.startswith(f"{subdomain}:") and stream_id in recv.active_streams:
                     receiver = recv
-                    logger.debug(f"[SERVER-STREAM] Found receiver {recv_id} for completed stream")
                     break
         
         if receiver:
@@ -315,7 +296,6 @@ class ConnectionManager:
             stream_handler = getattr(receiver, 'stream_handler', None)
             if stream_handler:
                 # New streaming architecture - just mark complete
-                logger.debug(f"[SERVER-STREAM] Using new streaming architecture for completion")
                 receiver.handle_complete(message)
                 await stream_handler.complete()
                 
@@ -330,10 +310,8 @@ class ConnectionManager:
                     self.stream_handlers.pop(stream_handler.request_id, None)
                 logger.info(f"Stream {stream_id} completed successfully")
             elif receiver.handle_complete(message):
-                logger.debug(f"[SERVER-STREAM] handle_complete returned True, getting assembled data")
                 # Get the complete data
                 data = receiver.get_assembled_data(stream_id)
-                logger.debug(f"[SERVER-STREAM] get_assembled_data returned: {type(data)}, size={len(data) if data else 'None'}")
                 stream = receiver.active_streams.get(stream_id)
                 
                 if data is not None and stream and "request_future" in stream:
@@ -453,7 +431,6 @@ class ConnectionManager:
         
         if stream_handler:
             # New streaming architecture
-            logger.debug(f"[{request_id}] Using new streaming architecture")
             
             if response_data.get("is_streaming"):
                 # Set metadata on the handler
@@ -467,12 +444,10 @@ class ConnectionManager:
                     logger.info(f"[SERVER-INIT] Creating/finding receiver with key: {receiver_key}")
                     with self.lock:
                         if receiver_key not in self.stream_receivers:
-                            logger.info(f"[SERVER-INIT] Creating new StreamReceiver for {receiver_key}")
                             self.stream_receivers[receiver_key] = StreamReceiver()
                         receiver = self.stream_receivers[receiver_key]
                         # Link handler to receiver
                         self.stream_receivers[receiver_key].stream_handler = stream_handler
-                        logger.info(f"[SERVER-INIT] Linked stream_handler to receiver {receiver_key}")
                     
                     # Initialize the stream
                     metadata = StreamMetadata(
@@ -484,12 +459,7 @@ class ConnectionManager:
                     )
                     receiver.start_stream(metadata, None)
                     receiver.active_streams[stream_id]["receiver_key"] = receiver_key
-                    logger.info(f"[SERVER-INIT] Started stream {stream_id} on receiver {receiver_key}")
-                    logger.info(f"[SERVER-INIT] Receiver now has active streams: {list(receiver.active_streams.keys())}")
                     
-                    # Log all receivers state
-                    with self.lock:
-                        logger.info(f"[SERVER-INIT] All active receivers after init: {list(self.stream_receivers.keys())}")
                     
                     logger.info(f"[{request_id}] Started streaming response for stream {stream_id}")
             else:
@@ -529,7 +499,6 @@ class ConnectionManager:
                             content_type=stream_info.get("content_type", "")
                         )
                         
-                        logger.debug(f"[SERVER-STREAM-INIT] Creating stream metadata: stream_id={stream_id}, request_id={request_id}, total_size={metadata.total_size}")
                         
                         receiver.start_stream(metadata, None)
                         
@@ -540,7 +509,6 @@ class ConnectionManager:
                         receiver.active_streams[stream_id]["subdomain"] = subdomain
                         receiver.active_streams[stream_id]["start_time"] = asyncio.get_event_loop().time()
                         
-                        logger.debug(f"[SERVER-STREAM-INIT] Stream {stream_id} initialized with future and metadata")
                         logger.info(f"[{request_id}] Started receiving stream {stream_id} with receiver key {receiver_key}")
                     else:
                         # No stream ID, complete with error
@@ -775,16 +743,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 if message_type == "keepalive_ack":
                     continue
                 elif message_type == "stream_chunk":
-                    logger.info(f"[SERVER-WS] Received stream_chunk message from {subdomain}")
                     stream_id = message.get("stream_id", "unknown")
-                    chunk_info = message.get("chunk", {})
-                    logger.info(f"[SERVER-WS] Chunk info: stream_id={stream_id}, index={chunk_info.get('index')}, size={chunk_info.get('size')}")
                     # Handle streaming chunk
                     await manager.handle_stream_chunk(subdomain, message)
                     continue
                 elif message_type == "stream_complete":
                     # Handle stream completion
-                    logger.info(f"[SERVER-WS] Received stream_complete message from {subdomain}: stream_id={message.get('stream_id')}, checksum={message.get('checksum', 'N/A')[:8]}...")
                     await manager.handle_stream_complete(subdomain, message)
                     continue
                 elif message_type == "stream_error":
