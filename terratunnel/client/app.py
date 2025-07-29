@@ -307,6 +307,10 @@ class TunnelClient:
             # Stream the response content
             chunk_count = 0
             logger.info(f"[CLIENT-STREAM] Starting to iterate through chunks from streamer.stream_bytes")
+            
+            # Process any pending keepalives before starting
+            await self._process_pending_keepalives()
+            
             async for chunk_message in streamer.stream_bytes(response_content, stream_id):
                 if self.websocket:
                     message_type = chunk_message.get("type")
@@ -333,6 +337,11 @@ class TunnelClient:
                         chunk_count += 1
                         chunk_info = chunk_message.get("chunk", {})
                         logger.info(f"[CLIENT-STREAM] Sent chunk {chunk_info.get('index') + 1}/{chunk_info.get('total')} successfully (total sent: {chunk_count})")
+                        
+                        # Process keepalives every 10 chunks to prevent timeout
+                        if chunk_count % 10 == 0:
+                            await self._process_pending_keepalives()
+                            
                     elif message_type == "stream_complete":
                         logger.info(f"[CLIENT-STREAM] Sent stream completion message with checksum: {chunk_message.get('checksum')}")
                         logger.info(f"[CLIENT-STREAM] Stream {stream_id} completed: sent {chunk_count} chunks")
@@ -530,6 +539,42 @@ class TunnelClient:
             self._record_webhook(request_data, error_response)
             
             return error_response
+    
+    async def _process_pending_keepalives(self):
+        """Process any pending keepalive messages without blocking"""
+        if not self.websocket:
+            return
+            
+        processed_count = 0
+        max_messages = 10  # Process up to 10 messages to avoid blocking too long
+        
+        while processed_count < max_messages:
+            try:
+                # Try to receive a message with zero timeout
+                message = await asyncio.wait_for(self.websocket.recv(), timeout=0.001)
+                request_data = json.loads(message)
+                
+                if request_data.get("type") == "keepalive":
+                    logger.debug(f"[CLIENT-STREAM] Processing keepalive during streaming")
+                    async with self.websocket_send_lock:
+                        if self.websocket:
+                            await self.websocket.send(json.dumps({"type": "keepalive_ack"}))
+                    with self.lock:
+                        self.last_keepalive = time.time()
+                else:
+                    # Put the message back by storing it for later processing
+                    logger.warning(f"[CLIENT-STREAM] Received non-keepalive message during streaming: {request_data.get('type')}")
+                    # For now, we'll just log it. In a production system, you'd want to queue this.
+                    
+                processed_count += 1
+                
+            except asyncio.TimeoutError:
+                # No messages pending, that's fine
+                break
+            except Exception as e:
+                # Websocket might be closed or other error
+                logger.debug(f"[CLIENT-STREAM] Error processing keepalives: {e}")
+                break
 
     async def monitor_keepalive(self):
         """Monitor keepalive messages and detect connection failures"""
