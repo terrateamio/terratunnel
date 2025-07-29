@@ -193,16 +193,13 @@ class TunnelClient:
         method = request_data.get("method", "GET")
         path = request_data.get("path", "/")
         
-        logger.debug(f"[{request_id}] Starting to process {method} {path}")
         
         try:
             # Handle HTTP request and track duration
             start_time = time.time()
-            logger.debug(f"[{request_id}] Calling handle_request")
             response_data = await self.handle_request(request_data)
             duration_ms = (time.time() - start_time) * 1000
             
-            logger.debug(f"[{request_id}] Request completed in {duration_ms:.0f}ms, status: {response_data.get('status_code')}")
             
             # Log request with duration
             self._log_request(request_data, response_data, duration_ms)
@@ -213,23 +210,16 @@ class TunnelClient:
             
             # Check if response needs streaming
             if response_data.get("is_streaming"):
-                logger.debug(f"[CLIENT-PROCESS] Response marked for streaming")
-                logger.debug(f"[CLIENT-PROCESS] Stream info: {response_data.get('stream')}")
                 
                 # Remove the response object before sending
                 streaming_response = response_data.pop("_streaming_response", None)
-                logger.debug(f"[CLIENT-PROCESS] Removed streaming response object: {type(streaming_response)}")
                 
                 # First send the initial response with streaming info
                 if self.websocket:
-                    logger.debug(f"[{request_id}] Sending initial streaming response via WebSocket")
-                    logger.debug(f"[CLIENT-PROCESS] Initial response keys: {list(response_data.keys())}")
-                    logger.debug(f"[CLIENT-PROCESS] Initial response is_streaming: {response_data.get('is_streaming')}")
                     async with self.websocket_send_lock:
                         # Check again inside the lock
                         if self.websocket:
                             await self.websocket.send(json.dumps(response_data))
-                            logger.debug(f"[{request_id}] Initial streaming response sent")
                         else:
                             logger.warning(f"[{request_id}] WebSocket closed before sending initial streaming response")
                             return
@@ -237,19 +227,16 @@ class TunnelClient:
                 # Put the response back for streaming
                 if streaming_response:
                     response_data["_streaming_response"] = streaming_response
-                    logger.debug(f"[CLIENT-PROCESS] Restored streaming response for content streaming")
                 
                 # Now stream the actual content
                 await self._stream_response_content(request_id, response_data)
             else:
                 # Send response back through WebSocket
                 if self.websocket:
-                    logger.debug(f"[{request_id}] Sending response back via WebSocket")
                     async with self.websocket_send_lock:
                         # Check again inside the lock
                         if self.websocket:
                             await self.websocket.send(json.dumps(response_data))
-                            logger.debug(f"[{request_id}] Response sent successfully")
                         else:
                             logger.warning(f"[{request_id}] WebSocket closed before sending response")
                 
@@ -277,8 +264,6 @@ class TunnelClient:
         stream_id = stream_info.get("id")
         response = response_data.get("_streaming_response")
         
-        logger.debug(f"[CLIENT-STREAM] Starting _stream_response_content for request {request_id}")
-        logger.debug(f"[CLIENT-STREAM] Stream info: {stream_info}")
         
         if not response:
             logger.error(f"[CLIENT-STREAM] No response object found for streaming")
@@ -287,12 +272,9 @@ class TunnelClient:
         content_size = stream_info.get("total_size", 0)
         
         try:
-            logger.info(f"[CLIENT-STREAM] Starting to stream {content_size} bytes for stream {stream_id}")
             
             # Read content once to avoid multiple accesses
             response_content = response.content
-            logger.info(f"[CLIENT-STREAM] Response content type: {type(response_content)}, size: {len(response_content)}")
-            logger.info(f"[CLIENT-STREAM] First 100 bytes of content: {response_content[:100]!r}")
             
             # Verify we actually have content
             if not response_content:
@@ -306,7 +288,6 @@ class TunnelClient:
             
             # Stream the response content
             chunk_count = 0
-            logger.info(f"[CLIENT-STREAM] Starting to iterate through chunks from streamer.stream_bytes")
             
             # Update keepalive timestamp during streaming to prevent timeout
             with self.lock:
@@ -315,21 +296,17 @@ class TunnelClient:
             async for chunk_message in streamer.stream_bytes(response_content, stream_id):
                 if self.websocket:
                     message_type = chunk_message.get("type")
-                    logger.info(f"[CLIENT-STREAM] Processing {message_type} message for stream {stream_id}")
                     
                     # Log the actual message being sent
                     if message_type == "stream_chunk":
                         chunk_info = chunk_message.get("chunk", {})
-                        logger.info(f"[CLIENT-STREAM] Chunk details: index={chunk_info.get('index')}/{chunk_info.get('total')-1}, size={chunk_info.get('size')}, data_len={len(chunk_info.get('data', ''))}, checksum={chunk_info.get('checksum', '')[:8]}...")
                     
                     message_json = json.dumps(chunk_message)
-                    logger.info(f"[CLIENT-STREAM] Sending WebSocket message type={message_type}, size={len(message_json)} bytes")
                     
                     async with self.websocket_send_lock:
                         # Check again inside the lock to prevent race condition
                         if self.websocket:
                             await self.websocket.send(message_json)
-                            logger.info(f"[CLIENT-STREAM] Successfully sent {message_type} message via WebSocket")
                         else:
                             logger.error(f"[CLIENT-STREAM] WebSocket closed during streaming, aborting stream {stream_id}")
                             break
@@ -337,7 +314,6 @@ class TunnelClient:
                     if message_type == "stream_chunk":
                         chunk_count += 1
                         chunk_info = chunk_message.get("chunk", {})
-                        logger.info(f"[CLIENT-STREAM] Sent chunk {chunk_info.get('index') + 1}/{chunk_info.get('total')} successfully (total sent: {chunk_count})")
                         
                         # Update keepalive timestamp every 10 chunks to prevent timeout
                         if chunk_count % 10 == 0:
@@ -345,12 +321,8 @@ class TunnelClient:
                                 self.last_keepalive = time.time()
                             
                     elif message_type == "stream_complete":
-                        logger.info(f"[CLIENT-STREAM] Sent stream completion message with checksum: {chunk_message.get('checksum')}")
-                        logger.info(f"[CLIENT-STREAM] Stream {stream_id} completed: sent {chunk_count} chunks")
+                        logger.info(f"Stream {stream_id} completed: sent {chunk_count} chunks")
             
-            logger.info(f"[CLIENT-STREAM] Streaming loop completed - total chunks sent: {chunk_count}")
-            if chunk_count == 0:
-                logger.error(f"[CLIENT-STREAM] WARNING: No chunks were sent! This indicates a problem.")
             
         except Exception as e:
             logger.error(f"[{request_id}] Error during streaming: {e}")
@@ -412,18 +384,14 @@ class TunnelClient:
             query_params = request_data.get("query_params", {})
             body = request_data.get("body", "")
             
-            logger.debug(f"[{request_id}] Processing {method} {path}")
             
             # Handle binary request body if present
             if request_data.get("is_binary") and body:
-                logger.debug(f"[{request_id}] Decoding binary request body")
                 body = base64.b64decode(body)
             
             url = f"{self.local_url}{path}"
-            logger.debug(f"[{request_id}] Making request to {url}")
             
             async with httpx.AsyncClient() as client:
-                logger.debug(f"[{request_id}] Sending HTTP request...")
                 response = await client.request(
                     method=method,
                     url=url,
@@ -432,7 +400,6 @@ class TunnelClient:
                     content=body,
                     timeout=600.0  # 10 minutes for large files
                 )
-                logger.debug(f"[{request_id}] HTTP request completed, status: {response.status_code}")
                 
                 # Check if response is binary based on content-type
                 content_type = response.headers.get("content-type", "").lower()
@@ -458,11 +425,9 @@ class TunnelClient:
                         use_streaming = content_size > STREAMING_THRESHOLD
                     else:
                         # No Content-Length header - always stream to avoid loading entire response
-                        logger.debug(f"[{request_id}] No Content-Length header, will use streaming")
                         content_size = 0  # Unknown size
                         use_streaming = True
                     
-                    logger.debug(f"[{request_id}] Response is binary, size: {content_size if content_size > 0 else 'unknown'} bytes")
                     
                     # Use streaming for large files or when size is unknown
                     if use_streaming:
@@ -472,15 +437,11 @@ class TunnelClient:
                             logger.info(f"[{request_id}] Response size unknown (no Content-Length header), using streaming")
                         
                         stream_id = str(uuid.uuid4())
-                        logger.debug(f"[CLIENT-STREAM-INIT] Created stream ID: {stream_id}")
-                        logger.debug(f"[CLIENT-STREAM-INIT] Response object type: {type(response)}")
-                        logger.debug(f"[CLIENT-STREAM-INIT] Response content available: {hasattr(response, 'content')}")
                         
                         # Calculate actual content size once
                         actual_content_size = content_size
                         if content_size <= 0 and hasattr(response, 'content'):
                             actual_content_size = len(response.content)
-                        logger.debug(f"[CLIENT-STREAM-INIT] Content size: {actual_content_size}")
                         
                         # Send initial response with streaming info
                         response_data["body"] = ""
@@ -492,22 +453,17 @@ class TunnelClient:
                             "content_type": content_type
                         }
                         
-                        logger.debug(f"[CLIENT-STREAM-INIT] Set response_data streaming fields: is_streaming={response_data.get('is_streaming')}, stream={response_data.get('stream')}")
                         
                         # Return response data with streaming flag
                         # The initial response will be sent by _process_request
                         response_data["_streaming_response"] = response  # Store for later streaming
-                        logger.debug(f"[CLIENT-STREAM-INIT] Stored response object for later streaming")
                         return response_data
                     
                     # For smaller files, use regular encoding
-                    logger.debug(f"[{request_id}] Encoding to base64...")
                     response_data["body"] = base64.b64encode(response.content).decode('ascii')
                     response_data["is_binary"] = True
-                    logger.debug(f"[{request_id}] Base64 encoding complete, size: {len(response_data['body'])} chars")
                 else:
                     text_size = len(response.text.encode('utf-8'))
-                    logger.debug(f"[{request_id}] Response is text, size: {text_size} bytes")
                     
                     if text_size > MAX_RESPONSE_SIZE:
                         logger.error(f"[{request_id}] Response too large: {text_size} bytes exceeds {MAX_RESPONSE_SIZE} bytes limit")
@@ -589,10 +545,8 @@ class TunnelClient:
                     
                     # Handle HTTP request concurrently
                     request_id = request_data.get("request_id", "unknown")
-                    logger.debug(f"Received request {request_id} - {request_data.get('method')} {request_data.get('path')}")
-                    task = asyncio.create_task(self._process_request(request_data))
-                    logger.debug(f"Created async task for request {request_id}")
-                    
+                        task = asyncio.create_task(self._process_request(request_data))
+                        
                 except websockets.exceptions.ConnectionClosed:
                     logger.info("WebSocket connection closed")
                     break

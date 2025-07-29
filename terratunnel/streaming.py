@@ -105,8 +105,6 @@ class ChunkedStreamer:
         total_chunks = (len(data) + self.chunk_size - 1) // self.chunk_size
         file_hasher = hashlib.sha256()
         
-        logger.debug(f"[STREAMING] Starting to stream {len(data)} bytes in {total_chunks} chunks (chunk_size={self.chunk_size}) for stream {stream_id}")
-        logger.debug(f"[STREAMING] First 100 bytes of data: {data[:100]!r}")
         
         for i in range(0, len(data), self.chunk_size):
             chunk = data[i:i + self.chunk_size]
@@ -119,7 +117,6 @@ class ChunkedStreamer:
             # Update file checksum
             file_hasher.update(chunk)
             
-            logger.debug(f"[STREAMING] Creating chunk {chunk_index}/{total_chunks-1}: size={len(chunk)}, checksum={chunk_checksum[:8]}..., preview={chunk[:50]!r}")
             
             # Yield chunk message
             chunk_msg = StreamMessage.chunk(
@@ -130,7 +127,6 @@ class ChunkedStreamer:
                 checksum=chunk_checksum
             )
             
-            logger.debug(f"[STREAMING] Yielding chunk message: type={chunk_msg['type']}, stream_id={chunk_msg['stream_id']}, chunk_index={chunk_msg['chunk']['index']}, data_len={len(chunk_msg['chunk']['data'])}")
             
             yield chunk_msg
             
@@ -138,11 +134,9 @@ class ChunkedStreamer:
             await asyncio.sleep(0)
         
         final_checksum = file_hasher.hexdigest()
-        logger.info(f"[STREAMING] All chunks created. Final file checksum: {final_checksum}")
         
         # Yield completion message
         complete_msg = StreamMessage.complete(stream_id, final_checksum)
-        logger.info(f"[STREAMING] Yielding completion message for stream {stream_id} with checksum {final_checksum}")
         yield complete_msg
     
     async def stream_response(self, response, stream_id: str) -> AsyncIterator[dict]:
@@ -187,7 +181,6 @@ class StreamReceiver:
     
     def start_stream(self, metadata: StreamMetadata, chunk_handler: Optional[Callable] = None):
         """Initialize a new incoming stream."""
-        logger.debug(f"[RECEIVER] Starting stream {metadata.stream_id}: total_size={metadata.total_size}, total_chunks={metadata.total_chunks}, content_type={metadata.content_type}")
         
         self.active_streams[metadata.stream_id] = {
             "metadata": metadata,
@@ -198,7 +191,6 @@ class StreamReceiver:
             "error": None
         }
         
-        logger.debug(f"[RECEIVER] Stream {metadata.stream_id} initialized. Active streams: {list(self.active_streams.keys())}")
         
         if chunk_handler:
             self._chunk_handlers[metadata.stream_id] = chunk_handler
@@ -206,9 +198,6 @@ class StreamReceiver:
     async def handle_chunk(self, message: dict) -> Optional[bytes]:
         """Process a chunk message."""
         stream_id = message.get("stream_id")
-        logger.debug(f"[RECEIVER] Handling chunk for stream {stream_id}")
-        logger.debug(f"[RECEIVER] Message keys: {list(message.keys())}")
-        logger.debug(f"[RECEIVER] Chunk data keys: {list(message.get('chunk', {}).keys())}")
         
         if stream_id not in self.active_streams:
             logger.error(f"[RECEIVER] Received chunk for unknown stream: {stream_id}. Active streams: {list(self.active_streams.keys())}")
@@ -224,11 +213,9 @@ class StreamReceiver:
         chunk_checksum = chunk_data.get("checksum", "")
         encoded_data = chunk_data.get("data", "")
         
-        logger.debug(f"[RECEIVER] Chunk details: index={chunk_index}, total={chunk_total}, size={chunk_size}, checksum={chunk_checksum[:8]}..., encoded_len={len(encoded_data)}")
         
         # Decode chunk data
         chunk_bytes = base64.b64decode(encoded_data)
-        logger.debug(f"[RECEIVER] Decoded chunk: actual_size={len(chunk_bytes)}, preview={chunk_bytes[:50]!r}")
         
         # Verify chunk checksum
         expected_checksum = chunk_checksum
@@ -244,13 +231,10 @@ class StreamReceiver:
         stream["received"] += 1
         stream["file_hasher"].update(chunk_bytes)
         
-        logger.debug(f"[RECEIVER] Stored chunk {chunk_index} for stream {stream_id}. Chunks dict now has keys: {sorted(stream['chunks'].keys())}")
-        logger.debug(f"[RECEIVER] Stream {stream_id}: {stream['received']}/{chunk_total} chunks received")
         
         # Update metadata if we didn't know total chunks before
         if stream["metadata"].total_chunks == 0:
             stream["metadata"].total_chunks = chunk_total
-            logger.debug(f"[RECEIVER] Updated stream metadata total_chunks to {chunk_total}")
         
         # Call chunk handler if registered
         if stream_id in self._chunk_handlers:
@@ -261,7 +245,6 @@ class StreamReceiver:
     def handle_complete(self, message: dict) -> bool:
         """Handle stream completion message."""
         stream_id = message.get("stream_id")
-        logger.debug(f"[RECEIVER] Handling completion for stream {stream_id}")
         
         if stream_id not in self.active_streams:
             logger.error(f"[RECEIVER] Completion for unknown stream: {stream_id}. Active streams: {list(self.active_streams.keys())}")
@@ -271,12 +254,6 @@ class StreamReceiver:
         expected_checksum = message.get("checksum")
         actual_checksum = stream["file_hasher"].hexdigest()
         
-        logger.debug(f"[RECEIVER] Stream {stream_id} completion check:")
-        logger.debug(f"[RECEIVER]   - Received chunks: {stream['received']}")
-        logger.debug(f"[RECEIVER]   - Chunks in dict: {len(stream['chunks'])}")
-        logger.debug(f"[RECEIVER]   - Chunk indices: {sorted(stream['chunks'].keys())}")
-        logger.debug(f"[RECEIVER]   - Expected checksum: {expected_checksum}")
-        logger.debug(f"[RECEIVER]   - Actual checksum: {actual_checksum}")
         
         if expected_checksum != actual_checksum:
             stream["error"] = f"File checksum mismatch: expected {expected_checksum}, got {actual_checksum}"
@@ -284,7 +261,7 @@ class StreamReceiver:
             return False
         
         stream["completed"] = True
-        logger.info(f"[RECEIVER] Stream {stream_id} completed successfully with {stream['received']} chunks")
+        logger.info(f"Stream {stream_id} completed successfully with {stream['received']} chunks")
         return True
     
     def handle_error(self, message: dict):
@@ -295,7 +272,6 @@ class StreamReceiver:
     
     def get_assembled_data(self, stream_id: str) -> Optional[bytes]:
         """Get the complete assembled data for a stream."""
-        logger.debug(f"[RECEIVER] Getting assembled data for stream {stream_id}")
         
         if stream_id not in self.active_streams:
             logger.error(f"[RECEIVER] Stream {stream_id} not found in active streams")
@@ -308,13 +284,8 @@ class StreamReceiver:
         
         # Get total chunks from metadata
         metadata = stream["metadata"]
-        logger.debug(f"[RECEIVER] Stream metadata type: {type(metadata)}")
-        logger.debug(f"[RECEIVER] Stream metadata: {metadata}")
         
         total_chunks = metadata.total_chunks
-        logger.debug(f"[RECEIVER] Assembling {total_chunks} chunks for stream {stream_id}")
-        logger.debug(f"[RECEIVER] Available chunk indices: {sorted(stream['chunks'].keys())}")
-        logger.debug(f"[RECEIVER] Number of chunks in dict: {len(stream['chunks'])}")
         
         # If total_chunks is 0, use the number of chunks we actually received
         if total_chunks == 0:
@@ -331,12 +302,9 @@ class StreamReceiver:
                 return None
             
             chunk_data = stream["chunks"][i]
-            logger.debug(f"[RECEIVER] Adding chunk {i} with size {len(chunk_data)} to result")
             result.extend(chunk_data)
         
         assembled_data = bytes(result)
-        logger.debug(f"[RECEIVER] Assembled data for stream {stream_id}: total_size={len(assembled_data)}")
-        logger.debug(f"[RECEIVER] First 100 bytes of assembled data: {assembled_data[:100]!r}")
         
         return assembled_data
     
