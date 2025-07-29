@@ -334,6 +334,31 @@ class Database:
                 """, (auth_provider, provider_user_id, provider_username, email, name, avatar_url, tunnel_subdomain))
                 user_id = cursor.lastrowid
                 logger.info(f"     Created new user: {provider_username} [{auth_provider}] (ID: {user_id}) with subdomain: {tunnel_subdomain}")
+                
+                # Also create an entry in the tunnels table for new users
+                # We need to check if they're admin to ensure proper handling
+                from .config import Config
+                is_admin = Config.is_admin_user(auth_provider, provider_username)
+                
+                # Check if this is a non-admin user who somehow already has a tunnel (shouldn't happen for new users)
+                if not is_admin:
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM tunnels 
+                        WHERE user_id = ? AND is_active = 1
+                    """, (user_id,))
+                    existing_tunnel_count = cursor.fetchone()[0]
+                    
+                    if existing_tunnel_count > 0:
+                        logger.warning(f"     New user {provider_username} already has {existing_tunnel_count} tunnels - skipping tunnel creation")
+                        conn.commit()
+                        return user_id
+                
+                # Create the tunnel entry
+                cursor.execute("""
+                    INSERT INTO tunnels (user_id, subdomain, name)
+                    VALUES (?, ?, ?)
+                """, (user_id, tunnel_subdomain, f"Default tunnel"))
+                logger.info(f"     Created tunnel entry for new user {provider_username} (admin: {is_admin})")
             
             conn.commit()
             return user_id

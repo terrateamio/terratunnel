@@ -8,6 +8,9 @@ class Config:
     GITHUB_CLIENT_ID: Optional[str] = os.getenv("GITHUB_CLIENT_ID")
     GITHUB_CLIENT_SECRET: Optional[str] = os.getenv("GITHUB_CLIENT_SECRET")
     
+    GITLAB_CLIENT_ID: Optional[str] = os.getenv("GITLAB_CLIENT_ID")
+    GITLAB_CLIENT_SECRET: Optional[str] = os.getenv("GITLAB_CLIENT_SECRET")
+    
     # JWT Configuration
     JWT_SECRET: str = os.getenv("JWT_SECRET", "change-me-in-production")
     JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
@@ -23,6 +26,7 @@ class Config:
     
     # OAuth Redirect URLs (to be set based on server domain)
     GITHUB_OAUTH_REDIRECT_PATH: str = "/auth/github/callback"
+    GITLAB_OAUTH_REDIRECT_PATH: str = "/auth/gitlab/callback"
     
     @classmethod
     def validate(cls):
@@ -33,8 +37,8 @@ class Config:
         if cls.JWT_SECRET == "change-me-in-production":
             logger.warning("     JWT_SECRET not set - using insecure default. Set JWT_SECRET environment variable!")
         
-        if cls.REQUIRE_AUTH_FOR_TUNNELS and not cls.has_github_oauth():
-            logger.warning("     REQUIRE_AUTH_FOR_TUNNELS is enabled but GitHub OAuth is not configured!")
+        if cls.REQUIRE_AUTH_FOR_TUNNELS and not cls.has_any_oauth():
+            logger.warning("     REQUIRE_AUTH_FOR_TUNNELS is enabled but no OAuth provider is configured!")
     
     @classmethod
     def has_github_oauth(cls) -> bool:
@@ -42,10 +46,26 @@ class Config:
         return bool(cls.GITHUB_CLIENT_ID and cls.GITHUB_CLIENT_SECRET)
     
     @classmethod
+    def has_gitlab_oauth(cls) -> bool:
+        """Check if GitLab OAuth is configured"""
+        return bool(cls.GITLAB_CLIENT_ID and cls.GITLAB_CLIENT_SECRET)
+    
+    @classmethod
+    def has_any_oauth(cls) -> bool:
+        """Check if any OAuth provider is configured"""
+        return cls.has_github_oauth() or cls.has_gitlab_oauth()
+    
+    @classmethod
     def get_github_oauth_redirect_uri(cls, domain: str, use_https: bool = True) -> str:
         """Get GitHub OAuth redirect URI for the given domain"""
         protocol = "https" if use_https else "http"
         return f"{protocol}://{domain}{cls.GITHUB_OAUTH_REDIRECT_PATH}"
+    
+    @classmethod
+    def get_gitlab_oauth_redirect_uri(cls, domain: str, use_https: bool = True) -> str:
+        """Get GitLab OAuth redirect URI for the given domain"""
+        protocol = "https" if use_https else "http"
+        return f"{protocol}://{domain}{cls.GITLAB_OAUTH_REDIRECT_PATH}"
     
     @classmethod
     def is_admin_user(cls, provider: str, username: str) -> bool:
