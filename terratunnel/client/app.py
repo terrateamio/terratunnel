@@ -51,7 +51,7 @@ class TunnelClient:
         self.max_history = 100  # Keep last 100 webhooks
         self.connection_start_time = None
         self.last_keepalive = None
-        self.keepalive_timeout = 35  # Server sends keepalive every 30s, timeout after 35s
+        self.keepalive_timeout = 120  # Increased timeout to handle long file transfers (2 minutes)
         self.reconnect_delay = 1  # Initial reconnect delay in seconds
         self.max_reconnect_delay = 60  # Maximum reconnect delay
         self.reconnect_attempts = 0
