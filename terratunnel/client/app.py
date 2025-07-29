@@ -288,15 +288,18 @@ class TunnelClient:
         
         try:
             logger.info(f"[CLIENT-STREAM] Starting to stream {content_size} bytes for stream {stream_id}")
-            logger.debug(f"[CLIENT-STREAM] Response content type: {type(response.content)}, size: {len(response.content)}")
-            logger.debug(f"[CLIENT-STREAM] First 100 bytes of content: {response.content[:100]!r}")
+            
+            # Read content once to avoid multiple accesses
+            response_content = response.content
+            logger.debug(f"[CLIENT-STREAM] Response content type: {type(response_content)}, size: {len(response_content)}")
+            logger.debug(f"[CLIENT-STREAM] First 100 bytes of content: {response_content[:100]!r}")
             
             # Create streamer
             streamer = ChunkedStreamer(chunk_size=DEFAULT_CHUNK_SIZE)
             
             # Stream the response content
             chunk_count = 0
-            async for chunk_message in streamer.stream_bytes(response.content, stream_id):
+            async for chunk_message in streamer.stream_bytes(response_content, stream_id):
                 if self.websocket:
                     message_type = chunk_message.get("type")
                     logger.debug(f"[CLIENT-STREAM] Sending {message_type} message for stream {stream_id}")
@@ -449,7 +452,12 @@ class TunnelClient:
                         logger.debug(f"[CLIENT-STREAM-INIT] Created stream ID: {stream_id}")
                         logger.debug(f"[CLIENT-STREAM-INIT] Response object type: {type(response)}")
                         logger.debug(f"[CLIENT-STREAM-INIT] Response content available: {hasattr(response, 'content')}")
-                        logger.debug(f"[CLIENT-STREAM-INIT] Content size from response.content: {len(response.content) if hasattr(response, 'content') else 'N/A'}")
+                        
+                        # Calculate actual content size once
+                        actual_content_size = content_size
+                        if content_size <= 0 and hasattr(response, 'content'):
+                            actual_content_size = len(response.content)
+                        logger.debug(f"[CLIENT-STREAM-INIT] Content size: {actual_content_size}")
                         
                         # Send initial response with streaming info
                         response_data["body"] = ""
@@ -457,7 +465,7 @@ class TunnelClient:
                         response_data["is_streaming"] = True
                         response_data["stream"] = {
                             "id": stream_id,
-                            "total_size": content_size if content_size > 0 else len(response.content),  # Use actual size if unknown
+                            "total_size": actual_content_size,
                             "content_type": content_type
                         }
                         

@@ -258,7 +258,7 @@ class ConnectionManager:
             logger.debug(f"[SERVER-STREAM] Found receiver {receiver_key} for stream {stream_id}")
             
             # Let receiver handle the chunk
-            receiver.handle_chunk(message)
+            await receiver.handle_chunk(message)
             
             # Check if we have a stream handler
             stream_handler = getattr(receiver, 'stream_handler', None)
