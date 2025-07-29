@@ -291,43 +291,55 @@ class TunnelClient:
             
             # Read content once to avoid multiple accesses
             response_content = response.content
-            logger.debug(f"[CLIENT-STREAM] Response content type: {type(response_content)}, size: {len(response_content)}")
-            logger.debug(f"[CLIENT-STREAM] First 100 bytes of content: {response_content[:100]!r}")
+            logger.info(f"[CLIENT-STREAM] Response content type: {type(response_content)}, size: {len(response_content)}")
+            logger.info(f"[CLIENT-STREAM] First 100 bytes of content: {response_content[:100]!r}")
+            
+            # Verify we actually have content
+            if not response_content:
+                logger.error(f"[CLIENT-STREAM] ERROR: Response content is empty! Cannot stream empty content.")
+                logger.error(f"[CLIENT-STREAM] Response object: {response}")
+                logger.error(f"[CLIENT-STREAM] Response headers: {getattr(response, 'headers', 'N/A')}")
+                return
             
             # Create streamer
             streamer = ChunkedStreamer(chunk_size=DEFAULT_CHUNK_SIZE)
             
             # Stream the response content
             chunk_count = 0
+            logger.info(f"[CLIENT-STREAM] Starting to iterate through chunks from streamer.stream_bytes")
             async for chunk_message in streamer.stream_bytes(response_content, stream_id):
                 if self.websocket:
                     message_type = chunk_message.get("type")
-                    logger.debug(f"[CLIENT-STREAM] Sending {message_type} message for stream {stream_id}")
+                    logger.info(f"[CLIENT-STREAM] Processing {message_type} message for stream {stream_id}")
                     
                     # Log the actual message being sent
                     if message_type == "stream_chunk":
                         chunk_info = chunk_message.get("chunk", {})
-                        logger.debug(f"[CLIENT-STREAM] Chunk message details: index={chunk_info.get('index')}, size={chunk_info.get('size')}, data_len={len(chunk_info.get('data', ''))}")
+                        logger.info(f"[CLIENT-STREAM] Chunk details: index={chunk_info.get('index')}/{chunk_info.get('total')-1}, size={chunk_info.get('size')}, data_len={len(chunk_info.get('data', ''))}, checksum={chunk_info.get('checksum', '')[:8]}...")
                     
                     message_json = json.dumps(chunk_message)
-                    logger.debug(f"[CLIENT-STREAM] Sending message (first 200 chars): {message_json[:200]}...")
+                    logger.info(f"[CLIENT-STREAM] Sending WebSocket message type={message_type}, size={len(message_json)} bytes")
                     
                     async with self.websocket_send_lock:
                         # Check again inside the lock to prevent race condition
                         if self.websocket:
                             await self.websocket.send(message_json)
+                            logger.info(f"[CLIENT-STREAM] Successfully sent {message_type} message via WebSocket")
                         else:
-                            logger.warning(f"[CLIENT-STREAM] WebSocket closed during streaming, aborting stream {stream_id}")
+                            logger.error(f"[CLIENT-STREAM] WebSocket closed during streaming, aborting stream {stream_id}")
                             break
                     
                     if message_type == "stream_chunk":
                         chunk_count += 1
                         chunk_info = chunk_message.get("chunk", {})
-                        logger.debug(f"[CLIENT-STREAM] Sent chunk {chunk_info.get('index') + 1}/{chunk_info.get('total')} (count={chunk_count})")
+                        logger.info(f"[CLIENT-STREAM] Sent chunk {chunk_info.get('index') + 1}/{chunk_info.get('total')} successfully (total sent: {chunk_count})")
                     elif message_type == "stream_complete":
                         logger.info(f"[CLIENT-STREAM] Sent stream completion message with checksum: {chunk_message.get('checksum')}")
+                        logger.info(f"[CLIENT-STREAM] Stream {stream_id} completed: sent {chunk_count} chunks")
             
-            logger.info(f"[CLIENT-STREAM] Streaming completed - sent {chunk_count} chunks")
+            logger.info(f"[CLIENT-STREAM] Streaming loop completed - total chunks sent: {chunk_count}")
+            if chunk_count == 0:
+                logger.error(f"[CLIENT-STREAM] WARNING: No chunks were sent! This indicates a problem.")
             
         except Exception as e:
             logger.error(f"[{request_id}] Error during streaming: {e}")
