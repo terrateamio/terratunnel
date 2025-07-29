@@ -226,8 +226,13 @@ class TunnelClient:
                     logger.debug(f"[CLIENT-PROCESS] Initial response keys: {list(response_data.keys())}")
                     logger.debug(f"[CLIENT-PROCESS] Initial response is_streaming: {response_data.get('is_streaming')}")
                     async with self.websocket_send_lock:
-                        await self.websocket.send(json.dumps(response_data))
-                    logger.debug(f"[{request_id}] Initial streaming response sent")
+                        # Check again inside the lock
+                        if self.websocket:
+                            await self.websocket.send(json.dumps(response_data))
+                            logger.debug(f"[{request_id}] Initial streaming response sent")
+                        else:
+                            logger.warning(f"[{request_id}] WebSocket closed before sending initial streaming response")
+                            return
                 
                 # Put the response back for streaming
                 if streaming_response:
@@ -241,8 +246,12 @@ class TunnelClient:
                 if self.websocket:
                     logger.debug(f"[{request_id}] Sending response back via WebSocket")
                     async with self.websocket_send_lock:
-                        await self.websocket.send(json.dumps(response_data))
-                    logger.debug(f"[{request_id}] Response sent successfully")
+                        # Check again inside the lock
+                        if self.websocket:
+                            await self.websocket.send(json.dumps(response_data))
+                            logger.debug(f"[{request_id}] Response sent successfully")
+                        else:
+                            logger.warning(f"[{request_id}] WebSocket closed before sending response")
                 
         except Exception as e:
             logger.error(f"Error processing request: {e}")
@@ -256,7 +265,9 @@ class TunnelClient:
                 }
                 try:
                     async with self.websocket_send_lock:
-                        await self.websocket.send(json.dumps(error_response))
+                        # Check again inside the lock
+                        if self.websocket:
+                            await self.websocket.send(json.dumps(error_response))
                 except Exception:
                     pass
 
@@ -299,7 +310,12 @@ class TunnelClient:
                     logger.debug(f"[CLIENT-STREAM] Sending message (first 200 chars): {message_json[:200]}...")
                     
                     async with self.websocket_send_lock:
-                        await self.websocket.send(message_json)
+                        # Check again inside the lock to prevent race condition
+                        if self.websocket:
+                            await self.websocket.send(message_json)
+                        else:
+                            logger.warning(f"[CLIENT-STREAM] WebSocket closed during streaming, aborting stream {stream_id}")
+                            break
                     
                     if message_type == "stream_chunk":
                         chunk_count += 1
@@ -316,7 +332,11 @@ class TunnelClient:
             if self.websocket:
                 error_msg = StreamMessage.error(stream_id, str(e))
                 async with self.websocket_send_lock:
-                    await self.websocket.send(json.dumps(error_msg))
+                    # Check again inside the lock
+                    if self.websocket:
+                        await self.websocket.send(json.dumps(error_msg))
+                    else:
+                        logger.warning(f"[CLIENT-STREAM] Cannot send error message - WebSocket closed")
         
         finally:
             # Clean up the response object from response_data
@@ -528,7 +548,9 @@ class TunnelClient:
                     
                     if request_data.get("type") == "keepalive":
                         async with self.websocket_send_lock:
-                            await self.websocket.send(json.dumps({"type": "keepalive_ack"}))
+                            # Check if websocket is still available
+                            if self.websocket:
+                                await self.websocket.send(json.dumps({"type": "keepalive_ack"}))
                         with self.lock:
                             self.last_keepalive = time.time()
                         continue

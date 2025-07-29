@@ -80,7 +80,7 @@ class StreamHandler:
         """Yield chunks as they arrive."""
         while True:
             try:
-                chunk = await asyncio.wait_for(self.chunk_queue.get(), timeout=60.0)
+                chunk = await asyncio.wait_for(self.chunk_queue.get(), timeout=300.0)
                 if chunk is None:
                     break
                 yield chunk
