@@ -545,7 +545,7 @@ class TunnelClient:
                     
                     # Handle HTTP request concurrently
                     request_id = request_data.get("request_id", "unknown")
-                        task = asyncio.create_task(self._process_request(request_data))
+                    task = asyncio.create_task(self._process_request(request_data))
                         
                 except websockets.exceptions.ConnectionClosed:
                     logger.info("WebSocket connection closed")
