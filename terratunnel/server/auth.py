@@ -1,5 +1,7 @@
 import secrets
 import json
+import sqlite3
+import logging
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -11,6 +13,8 @@ import httpx
 
 from .config import Config
 from .database import Database
+
+logger = logging.getLogger("terratunnel-server")
 
 # Create auth router
 auth_router = APIRouter(prefix="/auth", tags=["authentication"])
@@ -61,9 +65,6 @@ def generate_state(provider: str = None) -> str:
     """Generate a secure random state parameter for OAuth"""
     state = secrets.token_urlsafe(32)
     
-    # Enhanced debug logging
-    import logging
-    logger = logging.getLogger("terratunnel-server")
     logger.info(f"Generated new OAuth state: {state} for provider: {provider}")
     
     # Store state in database if available, fallback to in-memory
@@ -84,8 +85,6 @@ def verify_state(state: str, delete: bool = True) -> bool:
         state: The state parameter to verify
         delete: Whether to delete the state after verification (default: True)
     """
-    import logging
-    logger = logging.getLogger("terratunnel-server")
     
     # Use database if available
     if _db:
@@ -105,9 +104,22 @@ async def github_oauth_redirect(request: Request, redirect_uri: Optional[str] = 
     # Generate state for CSRF protection
     state = generate_state(provider="github")
     
-    # Store redirect URI in state data if provided
-    if redirect_uri:
-        store_state_data(state, provider="github", redirect_uri=redirect_uri)
+    # Update state data with redirect URI if provided (state already stored in generate_state)
+    if redirect_uri and _db:
+        # Update the existing state record with redirect_uri
+        conn = sqlite3.connect(_db.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE oauth_states 
+                SET redirect_uri = ?
+                WHERE state = ?
+            """, (redirect_uri, state))
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to update OAuth state with redirect_uri: {e}")
+        finally:
+            conn.close()
     
     # Get the server's domain from request
     host = request.headers.get("host", "localhost")
@@ -139,8 +151,6 @@ async def github_oauth_authorize_proxy(
         raise HTTPException(status_code=503, detail="GitHub OAuth not configured")
     
     # Log the incoming request
-    import logging
-    logger = logging.getLogger("terratunnel-server")
     logger.info(f"OAuth proxy request: redirect_uri={redirect_uri}, external_state={state}")
     
     # Store the external redirect URI and state for later
@@ -185,8 +195,6 @@ async def github_oauth_callback(
 ):
     """Handle OAuth callback from GitHub"""
     # Log the callback
-    import logging
-    logger = logging.getLogger("terratunnel-server")
     logger.info(f"OAuth callback received: code={code[:10] if code else None}..., state={state}, error={error}")
     
     # Check for OAuth errors first
@@ -353,8 +361,6 @@ async def github_oauth_callback(
             tunnel_url = f"https://{tunnel_subdomain}.{domain}"
             
             # Log tunnel creation details
-            import logging
-            logger = logging.getLogger("terratunnel-server")
             logger.info(f"Created tunnel for user {github_user['login']}: {tunnel_url} (API key: {api_key[:8]}...)")
             
             # Build redirect URL with all required parameters
@@ -375,8 +381,6 @@ async def github_oauth_callback(
             redirect_url = f"{external_redirect_uri}?{urlencode(params)}"
             
             # Log the callback for debugging
-            import logging
-            logger = logging.getLogger("terratunnel-server")
             logger.info(f"OAuth proxy callback: redirecting to {redirect_url}")
             
             return RedirectResponse(url=redirect_url, status_code=302)
@@ -407,16 +411,17 @@ async def github_oauth_callback(
         )
         return response
     else:
-        # API-based auth - return JSON with token
-        return JSONResponse({
-            "token": jwt_token,
-            "user": {
-                "id": user_id,
-                "username": user["provider_username"],
-                "email": user["email"],
-                "avatar_url": user["avatar_url"]
-            }
-        })
+        # No redirect URI - redirect to home page (dashboard)
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie(
+            key="auth_token",
+            value=jwt_token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=Config.JWT_EXPIRATION_HOURS * 3600
+        )
+        return response
 
 
 @auth_router.get("/login", response_class=HTMLResponse)
@@ -539,9 +544,22 @@ async def gitlab_oauth_redirect(request: Request, redirect_uri: Optional[str] = 
     # Generate state for CSRF protection
     state = generate_state(provider="gitlab")
     
-    # Store redirect URI in state data if provided
-    if redirect_uri:
-        store_state_data(state, provider="gitlab", redirect_uri=redirect_uri)
+    # Update state data with redirect URI if provided (state already stored in generate_state)
+    if redirect_uri and _db:
+        # Update the existing state record with redirect_uri
+        conn = sqlite3.connect(_db.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE oauth_states 
+                SET redirect_uri = ?
+                WHERE state = ?
+            """, (redirect_uri, state))
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to update OAuth state with redirect_uri: {e}")
+        finally:
+            conn.close()
     
     # Get the server's domain from request
     host = request.headers.get("host", "localhost")
@@ -573,8 +591,6 @@ async def gitlab_oauth_authorize_proxy(
         raise HTTPException(status_code=503, detail="GitLab OAuth not configured")
     
     # Log the incoming request
-    import logging
-    logger = logging.getLogger("terratunnel-server")
     logger.info(f"GitLab OAuth proxy request: redirect_uri={redirect_uri}, external_state={state}")
     
     # Store the external redirect URI and state for later
@@ -618,8 +634,6 @@ async def gitlab_oauth_callback(
 ):
     """Handle OAuth callback from GitLab"""
     # Log the callback
-    import logging
-    logger = logging.getLogger("terratunnel-server")
     logger.info(f"GitLab OAuth callback received: code={code[:10] if code else None}..., state={state}, error={error}")
     
     # Check for OAuth errors first
@@ -834,16 +848,17 @@ async def gitlab_oauth_callback(
         )
         return response
     else:
-        # API-based auth - return JSON with token
-        return JSONResponse({
-            "token": jwt_token,
-            "user": {
-                "id": user_id,
-                "username": user["provider_username"],
-                "email": user["email"],
-                "avatar_url": user["avatar_url"]
-            }
-        })
+        # No redirect URI - redirect to home page (dashboard)
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie(
+            key="auth_token",
+            value=jwt_token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=Config.JWT_EXPIRATION_HOURS * 3600
+        )
+        return response
 
 
 @auth_router.get("/logout")
