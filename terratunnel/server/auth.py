@@ -43,15 +43,26 @@ def set_database(db):
 
 def store_state_data(state: str, provider: str = None, redirect_uri: str = None,
                     external_redirect_uri: str = None, external_state: str = None) -> bool:
-    """Store OAuth state with additional data"""
+    """Store OAuth state with additional data
+    
+    NOTE: This function should only be used when you have a pre-existing state
+    that needs additional data. For new states, use generate_state() instead.
+    """
     if _db:
-        return _db.store_oauth_state(
+        success = _db.store_oauth_state(
             state, 
             provider=provider,
             redirect_uri=redirect_uri,
             external_redirect_uri=external_redirect_uri,
             external_state=external_state
         )
+        if success:
+            logger.info(f"Successfully stored OAuth state {state} with external_redirect_uri: {external_redirect_uri}")
+        else:
+            logger.error(f"Failed to store OAuth state {state}")
+        return success
+    else:
+        logger.error("Database not available for storing OAuth state")
     return False
 
 def get_state_data(state: str, delete: bool = True):
@@ -61,18 +72,23 @@ def get_state_data(state: str, delete: bool = True):
     return None
 
 
-def generate_state(provider: str = None) -> str:
-    """Generate a secure random state parameter for OAuth"""
+def generate_state(provider: str = None, store_in_db: bool = True) -> str:
+    """Generate a secure random state parameter for OAuth
+    
+    Args:
+        provider: The OAuth provider (github, gitlab, etc)
+        store_in_db: Whether to store the state in the database immediately (default: True)
+    """
     state = secrets.token_urlsafe(32)
     
     logger.info(f"Generated new OAuth state: {state} for provider: {provider}")
     
-    # Store state in database if available, fallback to in-memory
-    if _db:
+    # Store state in database if available and requested
+    if store_in_db and _db:
         _db.store_oauth_state(state, provider=provider)
         # Also clean up old states
         _db.cleanup_oauth_states()
-    else:
+    elif store_in_db and not _db:
         logger.warning("Database not available, OAuth states will not persist across restarts")
     
     return state
@@ -153,17 +169,22 @@ async def github_oauth_authorize_proxy(
     # Log the incoming request
     logger.info(f"OAuth proxy request: redirect_uri={redirect_uri}, external_state={state}")
     
-    # Store the external redirect URI and state for later
-    internal_state = generate_state(provider="github")
+    # Generate a new state WITHOUT storing it yet
+    internal_state = generate_state(provider="github", store_in_db=False)
     logger.info(f"Generated internal state: {internal_state}")
     
-    # Store both the external redirect_uri and external state
-    store_state_data(
-        internal_state, 
+    # Now store the state with all the data at once
+    success = store_state_data(
+        internal_state,
         provider="github",
         external_redirect_uri=redirect_uri,
         external_state=state
     )
+    
+    if success:
+        logger.info(f"Successfully stored OAuth state with proxy data")
+    else:
+        logger.error(f"Failed to store OAuth state with proxy data")
     
     # Get the server's domain from request
     host = request.headers.get("host", "localhost")
@@ -329,6 +350,12 @@ async def github_oauth_callback(
     # Check if this is an external OAuth proxy request
     external_redirect_uri = state_data.get('external_redirect_uri') if state_data else None
     external_state = state_data.get('external_state') if state_data else None
+    
+    # Enhanced logging for debugging
+    logger.info(f"GitHub OAuth callback - Full state_data: {state_data}")
+    logger.info(f"GitHub OAuth callback - redirect_uri: {redirect_uri}")
+    logger.info(f"GitHub OAuth callback - external_redirect_uri: {external_redirect_uri}")
+    logger.info(f"GitHub OAuth callback - external_state: {external_state}")
     
     if external_redirect_uri:
         # This is from the OAuth proxy - create tunnel and redirect back with all data
@@ -566,6 +593,12 @@ async def gitlab_oauth_redirect(request: Request, redirect_uri: Optional[str] = 
     is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
     callback_uri = Config.get_gitlab_oauth_redirect_uri(host, is_https)
     
+    logger.info(f"GitLab OAuth redirect - host header: {host}")
+    logger.info(f"GitLab OAuth redirect - is_https: {is_https}")
+    logger.info(f"GitLab OAuth redirect - scheme: {request.url.scheme}")
+    logger.info(f"GitLab OAuth redirect - x-forwarded-proto: {request.headers.get('x-forwarded-proto')}")
+    logger.info(f"GitLab OAuth redirect - callback_uri: {callback_uri}")
+    
     # Build GitLab OAuth URL
     gitlab_oauth_url = "https://gitlab.com/oauth/authorize"
     params = {
@@ -593,17 +626,22 @@ async def gitlab_oauth_authorize_proxy(
     # Log the incoming request
     logger.info(f"GitLab OAuth proxy request: redirect_uri={redirect_uri}, external_state={state}")
     
-    # Store the external redirect URI and state for later
-    internal_state = generate_state(provider="gitlab")
+    # Generate a new state WITHOUT storing it yet
+    internal_state = generate_state(provider="gitlab", store_in_db=False)
     logger.info(f"Generated internal state: {internal_state}")
     
-    # Store both the external redirect_uri and external state
-    store_state_data(
-        internal_state, 
+    # Now store the state with all the data at once
+    success = store_state_data(
+        internal_state,
         provider="gitlab",
         external_redirect_uri=redirect_uri,
         external_state=state
     )
+    
+    if success:
+        logger.info(f"Successfully stored OAuth state with proxy data")
+    else:
+        logger.error(f"Failed to store OAuth state with proxy data")
     
     # Get the server's domain from request
     host = request.headers.get("host", "localhost")
@@ -672,11 +710,75 @@ async def gitlab_oauth_callback(
     # Verify state parameter exists (don't delete yet, we need it for external redirect info)
     state_data = get_state_data(state, delete=False)
     if not state_data:
-        # State is invalid/expired - restart OAuth flow seamlessly
-        logger.warning(f"Invalid/expired state parameter: {state}. Restarting OAuth flow.")
+        # State is invalid/expired
+        logger.warning(f"Invalid/expired state parameter: {state}. State data not found in database.")
         
-        # Try to preserve the original intent
-        # Check for referer or default to home
+        # Check if this looks like it was meant to be an OAuth proxy request
+        # by checking the referer header
+        referer = request.headers.get("referer", "")
+        if "terrateam-setup" in referer or "/probot/" in referer:
+            logger.error(f"OAuth proxy state lost. Referer: {referer}")
+            # This was likely an OAuth proxy request but the state was lost
+            # Return an error page instead of restarting the flow
+            error_html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Authentication Error</title>
+                <style>
+                    body {
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        height: 100vh;
+                        margin: 0;
+                        background: #f5f5f5;
+                    }
+                    .error-container {
+                        background: white;
+                        padding: 40px;
+                        border-radius: 8px;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                        text-align: center;
+                        max-width: 500px;
+                    }
+                    h1 {
+                        color: #d73a49;
+                        margin-top: 0;
+                    }
+                    p {
+                        color: #666;
+                        line-height: 1.6;
+                    }
+                    .button {
+                        display: inline-block;
+                        padding: 10px 20px;
+                        background: #FC6D26;
+                        color: white;
+                        text-decoration: none;
+                        border-radius: 6px;
+                        margin-top: 20px;
+                    }
+                    .button:hover {
+                        background: #E24329;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="error-container">
+                    <h1>Authentication Error</h1>
+                    <p>The authentication session has expired or is invalid. This can happen if you took too long to authenticate or if there was a network issue.</p>
+                    <p>Please close this window and try authenticating again.</p>
+                    <a href="#" onclick="window.close(); return false;" class="button">Close Window</a>
+                </div>
+            </body>
+            </html>
+            """
+            return HTMLResponse(content=error_html, status_code=400)
+        
+        # Normal flow - restart OAuth
+        logger.warning(f"Restarting OAuth flow due to missing state.")
         redirect_after_auth = request.headers.get("referer")
         if redirect_after_auth and "gitlab.com" not in redirect_after_auth:
             return RedirectResponse(
@@ -693,6 +795,12 @@ async def gitlab_oauth_callback(
     host = request.headers.get("host", "localhost")
     is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
     callback_uri = Config.get_gitlab_oauth_redirect_uri(host, is_https)
+    
+    logger.info(f"GitLab OAuth callback token exchange - host header: {host}")
+    logger.info(f"GitLab OAuth callback token exchange - is_https: {is_https}")
+    logger.info(f"GitLab OAuth callback token exchange - scheme: {request.url.scheme}")
+    logger.info(f"GitLab OAuth callback token exchange - x-forwarded-proto: {request.headers.get('x-forwarded-proto')}")
+    logger.info(f"GitLab OAuth callback token exchange - callback_uri: {callback_uri}")
     
     data = {
         "client_id": Config.GITLAB_CLIENT_ID,
@@ -712,6 +820,8 @@ async def gitlab_oauth_callback(
         token_data = token_response.json()
         
         if "error" in token_data:
+            logger.error(f"GitLab token exchange failed - Response: {token_data}")
+            logger.error(f"GitLab token exchange failed - Request data: {data}")
             raise HTTPException(
                 status_code=400, 
                 detail=f"Failed to get access token: {token_data.get('error_description', token_data['error'])}"
@@ -768,6 +878,12 @@ async def gitlab_oauth_callback(
     # Check if this is an external OAuth proxy request
     external_redirect_uri = state_data.get('external_redirect_uri') if state_data else None
     external_state = state_data.get('external_state') if state_data else None
+    
+    # Enhanced logging for debugging
+    logger.info(f"GitLab OAuth callback - Full state_data: {state_data}")
+    logger.info(f"GitLab OAuth callback - redirect_uri: {redirect_uri}")
+    logger.info(f"GitLab OAuth callback - external_redirect_uri: {external_redirect_uri}")
+    logger.info(f"GitLab OAuth callback - external_state: {external_state}")
     
     if external_redirect_uri:
         # This is from the OAuth proxy - create tunnel and redirect back with all data
@@ -848,7 +964,42 @@ async def gitlab_oauth_callback(
         )
         return response
     else:
-        # No redirect URI - redirect to home page (dashboard)
+        # No redirect URI found in state
+        logger.warning(f"No redirect URI found for user {gitlab_user['username']} after successful auth")
+        
+        # Check if this might be a lost terrateam-setup request by examining the referer
+        referer = request.headers.get("referer", "")
+        if "terrateam" in referer or "probot" in referer:
+            logger.error(f"Possible lost terrateam-setup OAuth request. Referer: {referer}")
+            # Return an error page that the popup can handle
+            error_html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Authentication Complete</title>
+                <script>
+                    // Try to send a message to the opener window
+                    if (window.opener) {
+                        window.opener.postMessage({
+                            type: 'GITLAB_OAUTH_ERROR',
+                            error: 'Session lost - please try again'
+                        }, '*');
+                    }
+                    // Close the window after a short delay
+                    setTimeout(function() {
+                        window.close();
+                    }, 2000);
+                </script>
+            </head>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h2>Authentication session lost</h2>
+                <p>Please close this window and try again.</p>
+            </body>
+            </html>
+            """
+            return HTMLResponse(content=error_html)
+        
+        # Normal case - redirect to home page (dashboard)
         response = RedirectResponse(url="/", status_code=302)
         response.set_cookie(
             key="auth_token",
