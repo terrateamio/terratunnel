@@ -1,5 +1,7 @@
 import secrets
 import json
+import sqlite3
+import logging
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -11,6 +13,8 @@ import httpx
 
 from .config import Config
 from .database import Database
+
+logger = logging.getLogger("terratunnel-server")
 
 # Create auth router
 auth_router = APIRouter(prefix="/auth", tags=["authentication"])
@@ -29,21 +33,47 @@ def get_database() -> Database:
         raise RuntimeError("Database not initialized")
     return _db
 
-# Store for OAuth state parameters (in production, use Redis or similar)
-oauth_states = {}
+# Database instance will be set by the app
+_db = None
+
+def set_database(db):
+    """Set the database instance for OAuth state storage"""
+    global _db
+    _db = db
+
+def store_state_data(state: str, provider: str = None, redirect_uri: str = None,
+                    external_redirect_uri: str = None, external_state: str = None) -> bool:
+    """Store OAuth state with additional data"""
+    if _db:
+        return _db.store_oauth_state(
+            state, 
+            provider=provider,
+            redirect_uri=redirect_uri,
+            external_redirect_uri=external_redirect_uri,
+            external_state=external_state
+        )
+    return False
+
+def get_state_data(state: str, delete: bool = True):
+    """Get OAuth state data from database"""
+    if _db:
+        return _db.verify_oauth_state(state, delete=delete)
+    return None
 
 
-def generate_state() -> str:
+def generate_state(provider: str = None) -> str:
     """Generate a secure random state parameter for OAuth"""
     state = secrets.token_urlsafe(32)
-    # Store state with timestamp for cleanup
-    oauth_states[state] = datetime.now(timezone.utc)
     
-    # Clean up old states (older than 10 minutes)
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
-    expired_states = [s for s, t in oauth_states.items() if isinstance(t, datetime) and t < cutoff]
-    for state in expired_states:
-        del oauth_states[state]
+    logger.info(f"Generated new OAuth state: {state} for provider: {provider}")
+    
+    # Store state in database if available, fallback to in-memory
+    if _db:
+        _db.store_oauth_state(state, provider=provider)
+        # Also clean up old states
+        _db.cleanup_oauth_states()
+    else:
+        logger.warning("Database not available, OAuth states will not persist across restarts")
     
     return state
 
@@ -55,27 +85,14 @@ def verify_state(state: str, delete: bool = True) -> bool:
         state: The state parameter to verify
         delete: Whether to delete the state after verification (default: True)
     """
-    if state not in oauth_states:
-        import logging
-        logger = logging.getLogger("terratunnel-server")
-        logger.warning(f"State not found in oauth_states: {state}")
-        logger.warning(f"Available states: {list(oauth_states.keys())}")
+    
+    # Use database if available
+    if _db:
+        state_data = _db.verify_oauth_state(state, delete=delete)
+        return state_data is not None
+    else:
+        logger.warning("Database not available, OAuth state verification disabled")
         return False
-    
-    # Check if state is not too old (10 minutes max)
-    created_at = oauth_states[state]
-    if isinstance(created_at, datetime):
-        if datetime.now(timezone.utc) - created_at > timedelta(minutes=10):
-            del oauth_states[state]
-            import logging
-            logger = logging.getLogger("terratunnel-server")
-            logger.warning(f"State expired (older than 10 minutes): {state}")
-            return False
-    
-    # State is valid, optionally remove it (one-time use)
-    if delete:
-        del oauth_states[state]
-    return True
 
 
 @auth_router.get("/github")
@@ -85,11 +102,24 @@ async def github_oauth_redirect(request: Request, redirect_uri: Optional[str] = 
         raise HTTPException(status_code=503, detail="GitHub OAuth not configured")
     
     # Generate state for CSRF protection
-    state = generate_state()
+    state = generate_state(provider="github")
     
-    # Store redirect URI in state data if provided
-    if redirect_uri:
-        oauth_states[f"{state}_redirect"] = redirect_uri
+    # Update state data with redirect URI if provided (state already stored in generate_state)
+    if redirect_uri and _db:
+        # Update the existing state record with redirect_uri
+        conn = sqlite3.connect(_db.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE oauth_states 
+                SET redirect_uri = ?
+                WHERE state = ?
+            """, (redirect_uri, state))
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to update OAuth state with redirect_uri: {e}")
+        finally:
+            conn.close()
     
     # Get the server's domain from request
     host = request.headers.get("host", "localhost")
@@ -121,18 +151,19 @@ async def github_oauth_authorize_proxy(
         raise HTTPException(status_code=503, detail="GitHub OAuth not configured")
     
     # Log the incoming request
-    import logging
-    logger = logging.getLogger("terratunnel-server")
     logger.info(f"OAuth proxy request: redirect_uri={redirect_uri}, external_state={state}")
     
     # Store the external redirect URI and state for later
-    internal_state = generate_state()
+    internal_state = generate_state(provider="github")
     logger.info(f"Generated internal state: {internal_state}")
     
     # Store both the external redirect_uri and external state
-    oauth_states[f"{internal_state}_external_redirect"] = redirect_uri
-    if state:
-        oauth_states[f"{internal_state}_external_state"] = state
+    store_state_data(
+        internal_state, 
+        provider="github",
+        external_redirect_uri=redirect_uri,
+        external_state=state
+    )
     
     # Get the server's domain from request
     host = request.headers.get("host", "localhost")
@@ -157,28 +188,27 @@ async def github_oauth_authorize_proxy(
 @auth_router.get("/github/callback")
 async def github_oauth_callback(
     request: Request,
-    code: str,
-    state: str,
+    code: str = None,
+    state: str = None,
     error: Optional[str] = None,
     error_description: Optional[str] = None
 ):
     """Handle OAuth callback from GitHub"""
     # Log the callback
-    import logging
-    logger = logging.getLogger("terratunnel-server")
     logger.info(f"OAuth callback received: code={code[:10] if code else None}..., state={state}, error={error}")
     
     # Check for OAuth errors first
     if error:
         # Check if this is an external OAuth proxy request that had an error
-        external_redirect_uri = oauth_states.get(f"{state}_external_redirect")
+        state_data = get_state_data(state, delete=False) if state else None
+        external_redirect_uri = state_data.get('external_redirect_uri') if state_data else None
         if external_redirect_uri:
             # Get external state before cleaning up
-            external_state_err = oauth_states.get(f"{state}_external_state")
+            external_state_err = state_data.get('external_state') if state_data else None
             
-            # Clean up state
-            oauth_states.pop(f"{state}_external_redirect", None)
-            oauth_states.pop(f"{state}_external_state", None)
+            # Clean up state from database
+            if state:
+                get_state_data(state, delete=True)
             
             # Redirect back to external service with error
             from urllib.parse import urlencode
@@ -192,15 +222,31 @@ async def github_oauth_callback(
             redirect_url = f"{external_redirect_uri}?{urlencode(error_params)}"
             return RedirectResponse(url=redirect_url, status_code=302)
         else:
-            # Normal error handling
-            error_msg = f"OAuth error: {error}"
-            if error_description:
-                error_msg += f" - {error_description}"
-            raise HTTPException(status_code=400, detail=error_msg)
+            # Normal error handling - restart OAuth flow
+            logger.warning(f"OAuth error received: {error}. Restarting flow.")
+            return RedirectResponse(url="/auth/login", status_code=302)
     
-    # Verify state parameter (don't delete yet, we need it for external redirect info)
-    if not verify_state(state, delete=False):
-        raise HTTPException(status_code=400, detail="Invalid or expired state parameter")
+    # Check if we have required parameters
+    if not code or not state:
+        logger.warning("OAuth callback missing code or state. Restarting flow.")
+        return RedirectResponse(url="/auth/login", status_code=302)
+    
+    # Verify state parameter exists (don't delete yet, we need it for external redirect info)
+    state_data = get_state_data(state, delete=False)
+    if not state_data:
+        # State is invalid/expired - restart OAuth flow seamlessly
+        logger.warning(f"Invalid/expired state parameter: {state}. Restarting OAuth flow.")
+        
+        # Try to preserve the original intent
+        # Check for referer or default to home
+        redirect_after_auth = request.headers.get("referer")
+        if redirect_after_auth and "github.com" not in redirect_after_auth:
+            return RedirectResponse(
+                url=f"/auth/github?redirect_uri={redirect_after_auth}",
+                status_code=302
+            )
+        else:
+            return RedirectResponse(url="/auth/github", status_code=302)
     
     # Exchange code for access token
     token_url = "https://github.com/login/oauth/access_token"
@@ -273,15 +319,16 @@ async def github_oauth_callback(
     
     jwt_token = jwt.encode(jwt_payload, Config.JWT_SECRET, algorithm=Config.JWT_ALGORITHM)
     
+    # Get state data from database and delete it (one-time use)
+    # We already have state_data from above, just need to delete it now
+    get_state_data(state, delete=True)
+    
     # Check if there was a redirect URI stored (normal auth flow)
-    redirect_uri = oauth_states.pop(f"{state}_redirect", None)
+    redirect_uri = state_data.get('redirect_uri') if state_data else None
     
-    # Check if this is an external OAuth proxy request (from /auth/github/authorize)
-    external_redirect_uri = oauth_states.pop(f"{state}_external_redirect", None)
-    external_state = oauth_states.pop(f"{state}_external_state", None)
-    
-    # Now we can safely delete the state since we've retrieved all associated data
-    oauth_states.pop(state, None)
+    # Check if this is an external OAuth proxy request
+    external_redirect_uri = state_data.get('external_redirect_uri') if state_data else None
+    external_state = state_data.get('external_state') if state_data else None
     
     if external_redirect_uri:
         # This is from the OAuth proxy - create tunnel and redirect back with all data
@@ -314,8 +361,6 @@ async def github_oauth_callback(
             tunnel_url = f"https://{tunnel_subdomain}.{domain}"
             
             # Log tunnel creation details
-            import logging
-            logger = logging.getLogger("terratunnel-server")
             logger.info(f"Created tunnel for user {github_user['login']}: {tunnel_url} (API key: {api_key[:8]}...)")
             
             # Build redirect URL with all required parameters
@@ -336,8 +381,6 @@ async def github_oauth_callback(
             redirect_url = f"{external_redirect_uri}?{urlencode(params)}"
             
             # Log the callback for debugging
-            import logging
-            logger = logging.getLogger("terratunnel-server")
             logger.info(f"OAuth proxy callback: redirecting to {redirect_url}")
             
             return RedirectResponse(url=redirect_url, status_code=302)
@@ -368,16 +411,17 @@ async def github_oauth_callback(
         )
         return response
     else:
-        # API-based auth - return JSON with token
-        return JSONResponse({
-            "token": jwt_token,
-            "user": {
-                "id": user_id,
-                "username": user["provider_username"],
-                "email": user["email"],
-                "avatar_url": user["avatar_url"]
-            }
-        })
+        # No redirect URI - redirect to home page (dashboard)
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie(
+            key="auth_token",
+            value=jwt_token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=Config.JWT_EXPIRATION_HOURS * 3600
+        )
+        return response
 
 
 @auth_router.get("/login", response_class=HTMLResponse)
@@ -498,11 +542,24 @@ async def gitlab_oauth_redirect(request: Request, redirect_uri: Optional[str] = 
         raise HTTPException(status_code=503, detail="GitLab OAuth not configured")
     
     # Generate state for CSRF protection
-    state = generate_state()
+    state = generate_state(provider="gitlab")
     
-    # Store redirect URI in state data if provided
-    if redirect_uri:
-        oauth_states[f"{state}_redirect"] = redirect_uri
+    # Update state data with redirect URI if provided (state already stored in generate_state)
+    if redirect_uri and _db:
+        # Update the existing state record with redirect_uri
+        conn = sqlite3.connect(_db.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE oauth_states 
+                SET redirect_uri = ?
+                WHERE state = ?
+            """, (redirect_uri, state))
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to update OAuth state with redirect_uri: {e}")
+        finally:
+            conn.close()
     
     # Get the server's domain from request
     host = request.headers.get("host", "localhost")
@@ -534,18 +591,19 @@ async def gitlab_oauth_authorize_proxy(
         raise HTTPException(status_code=503, detail="GitLab OAuth not configured")
     
     # Log the incoming request
-    import logging
-    logger = logging.getLogger("terratunnel-server")
     logger.info(f"GitLab OAuth proxy request: redirect_uri={redirect_uri}, external_state={state}")
     
     # Store the external redirect URI and state for later
-    internal_state = generate_state()
+    internal_state = generate_state(provider="gitlab")
     logger.info(f"Generated internal state: {internal_state}")
     
     # Store both the external redirect_uri and external state
-    oauth_states[f"{internal_state}_external_redirect"] = redirect_uri
-    if state:
-        oauth_states[f"{internal_state}_external_state"] = state
+    store_state_data(
+        internal_state, 
+        provider="gitlab",
+        external_redirect_uri=redirect_uri,
+        external_state=state
+    )
     
     # Get the server's domain from request
     host = request.headers.get("host", "localhost")
@@ -569,28 +627,27 @@ async def gitlab_oauth_authorize_proxy(
 @auth_router.get("/gitlab/callback")
 async def gitlab_oauth_callback(
     request: Request,
-    code: str,
-    state: str,
+    code: str = None,
+    state: str = None,
     error: Optional[str] = None,
     error_description: Optional[str] = None
 ):
     """Handle OAuth callback from GitLab"""
     # Log the callback
-    import logging
-    logger = logging.getLogger("terratunnel-server")
     logger.info(f"GitLab OAuth callback received: code={code[:10] if code else None}..., state={state}, error={error}")
     
     # Check for OAuth errors first
     if error:
         # Check if this is an external OAuth proxy request that had an error
-        external_redirect_uri = oauth_states.get(f"{state}_external_redirect")
+        state_data = get_state_data(state, delete=False) if state else None
+        external_redirect_uri = state_data.get('external_redirect_uri') if state_data else None
         if external_redirect_uri:
             # Get external state before cleaning up
-            external_state_err = oauth_states.get(f"{state}_external_state")
+            external_state_err = state_data.get('external_state') if state_data else None
             
-            # Clean up state
-            oauth_states.pop(f"{state}_external_redirect", None)
-            oauth_states.pop(f"{state}_external_state", None)
+            # Clean up state from database
+            if state:
+                get_state_data(state, delete=True)
             
             # Redirect back to external service with error
             error_params = {
@@ -603,15 +660,31 @@ async def gitlab_oauth_callback(
             redirect_url = f"{external_redirect_uri}?{urlencode(error_params)}"
             return RedirectResponse(url=redirect_url, status_code=302)
         else:
-            # Normal error handling
-            error_msg = f"OAuth error: {error}"
-            if error_description:
-                error_msg += f" - {error_description}"
-            raise HTTPException(status_code=400, detail=error_msg)
+            # Normal error handling - restart OAuth flow
+            logger.warning(f"OAuth error received: {error}. Restarting flow.")
+            return RedirectResponse(url="/auth/login", status_code=302)
     
-    # Verify state parameter (don't delete yet, we need it for external redirect info)
-    if not verify_state(state, delete=False):
-        raise HTTPException(status_code=400, detail="Invalid or expired state parameter")
+    # Check if we have required parameters
+    if not code or not state:
+        logger.warning("OAuth callback missing code or state. Restarting flow.")
+        return RedirectResponse(url="/auth/login", status_code=302)
+    
+    # Verify state parameter exists (don't delete yet, we need it for external redirect info)
+    state_data = get_state_data(state, delete=False)
+    if not state_data:
+        # State is invalid/expired - restart OAuth flow seamlessly
+        logger.warning(f"Invalid/expired state parameter: {state}. Restarting OAuth flow.")
+        
+        # Try to preserve the original intent
+        # Check for referer or default to home
+        redirect_after_auth = request.headers.get("referer")
+        if redirect_after_auth and "gitlab.com" not in redirect_after_auth:
+            return RedirectResponse(
+                url=f"/auth/gitlab?redirect_uri={redirect_after_auth}",
+                status_code=302
+            )
+        else:
+            return RedirectResponse(url="/auth/gitlab", status_code=302)
     
     # Exchange code for access token
     token_url = "https://gitlab.com/oauth/token"
@@ -685,15 +758,16 @@ async def gitlab_oauth_callback(
     
     jwt_token = jwt.encode(jwt_payload, Config.JWT_SECRET, algorithm=Config.JWT_ALGORITHM)
     
+    # Get state data from database and delete it (one-time use)
+    # We already have state_data from above, just need to delete it now
+    get_state_data(state, delete=True)
+    
     # Check if there was a redirect URI stored (normal auth flow)
-    redirect_uri = oauth_states.pop(f"{state}_redirect", None)
+    redirect_uri = state_data.get('redirect_uri') if state_data else None
     
-    # Check if this is an external OAuth proxy request (from /auth/gitlab/authorize)
-    external_redirect_uri = oauth_states.pop(f"{state}_external_redirect", None)
-    external_state = oauth_states.pop(f"{state}_external_state", None)
-    
-    # Now we can safely delete the state since we've retrieved all associated data
-    oauth_states.pop(state, None)
+    # Check if this is an external OAuth proxy request
+    external_redirect_uri = state_data.get('external_redirect_uri') if state_data else None
+    external_state = state_data.get('external_state') if state_data else None
     
     if external_redirect_uri:
         # This is from the OAuth proxy - create tunnel and redirect back with all data
@@ -774,16 +848,17 @@ async def gitlab_oauth_callback(
         )
         return response
     else:
-        # API-based auth - return JSON with token
-        return JSONResponse({
-            "token": jwt_token,
-            "user": {
-                "id": user_id,
-                "username": user["provider_username"],
-                "email": user["email"],
-                "avatar_url": user["avatar_url"]
-            }
-        })
+        # No redirect URI - redirect to home page (dashboard)
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie(
+            key="auth_token",
+            value=jwt_token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=Config.JWT_EXPIRATION_HOURS * 3600
+        )
+        return response
 
 
 @auth_router.get("/logout")

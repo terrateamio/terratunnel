@@ -117,6 +117,20 @@ class Database:
             )
         """)
         
+        # Create oauth_states table for persistent state storage
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                state TEXT UNIQUE NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                redirect_uri TEXT,
+                external_redirect_uri TEXT,
+                external_state TEXT,
+                provider TEXT,
+                additional_data TEXT
+            )
+        """)
+        
         # Create tunnel_audit_log table with user_id
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tunnel_audit_log (
@@ -708,3 +722,99 @@ class Database:
             if not cursor.fetchone():
                 logger.warning(f"Had to use random subdomain after {max_attempts} attempts")
                 return subdomain
+    
+    def store_oauth_state(self, state: str, provider: str = None, redirect_uri: str = None,
+                         external_redirect_uri: str = None, external_state: str = None,
+                         additional_data: str = None) -> bool:
+        """Store OAuth state in database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            # Clean up states older than 10 minutes
+            cursor.execute("""
+                DELETE FROM oauth_states 
+                WHERE datetime(created_at) < datetime('now', '-10 minutes')
+            """)
+            
+            # Insert new state
+            cursor.execute("""
+                INSERT INTO oauth_states (state, provider, redirect_uri, 
+                                        external_redirect_uri, external_state, additional_data)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (state, provider, redirect_uri, external_redirect_uri, external_state, additional_data))
+            
+            conn.commit()
+            logger.debug(f"Stored OAuth state in database: {state}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to store OAuth state: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def verify_oauth_state(self, state: str, delete: bool = True) -> Dict:
+        """Verify OAuth state from database"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        try:
+            # Check if state exists and is not expired
+            cursor.execute("""
+                SELECT * FROM oauth_states 
+                WHERE state = ? 
+                AND datetime(created_at) >= datetime('now', '-10 minutes')
+            """, (state,))
+            
+            row = cursor.fetchone()
+            if not row:
+                logger.warning(f"OAuth state not found or expired: {state}")
+                
+                # Log available states for debugging
+                cursor.execute("SELECT state, created_at FROM oauth_states ORDER BY created_at DESC LIMIT 10")
+                available_states = cursor.fetchall()
+                if available_states:
+                    logger.debug(f"Recent states in database: {[dict(s) for s in available_states]}")
+                else:
+                    logger.debug("No states found in database")
+                
+                return None
+            
+            result = dict(row)
+            
+            if delete:
+                cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+                conn.commit()
+                logger.debug(f"Deleted OAuth state after verification: {state}")
+            
+            return result
+        except Exception as e:
+            logger.error(f"Failed to verify OAuth state: {e}")
+            return None
+        finally:
+            conn.close()
+    
+    def cleanup_oauth_states(self) -> int:
+        """Clean up expired OAuth states"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                DELETE FROM oauth_states 
+                WHERE datetime(created_at) < datetime('now', '-10 minutes')
+            """)
+            
+            deleted = cursor.rowcount
+            conn.commit()
+            
+            if deleted > 0:
+                logger.info(f"Cleaned up {deleted} expired OAuth states")
+            
+            return deleted
+        except Exception as e:
+            logger.error(f"Failed to cleanup OAuth states: {e}")
+            return 0
+        finally:
+            conn.close()

@@ -1309,11 +1309,16 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
     from .auth import get_current_user_from_cookie
     
     user = None
+    expired_token = False
     if auth_token:
         try:
             user = await get_current_user_from_cookie(request, auth_token)
+            # If we got None back but had a token, it might be expired
+            if user is None:
+                expired_token = True
         except:
-            pass
+            # Any exception means the token is invalid
+            expired_token = True
     
     if user:
         # User is logged in, show dashboard
@@ -1657,6 +1662,14 @@ async def home_page(request: Request, auth_token: Optional[str] = Cookie(None)):
         """
     else:
         # User is not logged in, show login page
+        # If we have an expired token, we need to clear it
+        if expired_token:
+            response = HTMLResponse(content="", status_code=302)
+            response.delete_cookie("auth_token")
+            # Redirect to the same page without the cookie
+            response.headers["Location"] = "/"
+            return response
+        
         html = f"""
         <!DOCTYPE html>
         <html>
