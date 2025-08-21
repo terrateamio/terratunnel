@@ -74,6 +74,13 @@ class TunnelClient:
         try:
             logger.info(f"Connecting to tunnel server at {self.ws_url}...")
             
+            # Clean up any previous state before connecting
+            with self.lock:
+                self.assigned_hostname = None
+                self.subdomain = None
+                self.connection_start_time = None
+                self.last_keepalive = None
+            
             # Prepare headers with API key if provided
             headers = {}
             if self.api_key:
@@ -113,6 +120,20 @@ class TunnelClient:
             if hostname_data.get("type") == "hostname_assigned":
                 self.assigned_hostname = hostname_data.get("hostname")
                 self.subdomain = hostname_data.get("subdomain")
+                
+                # Test the connection with a WebSocket ping before declaring success
+                try:
+                    pong_waiter = await self.websocket.ping()
+                    await asyncio.wait_for(pong_waiter, timeout=5.0)
+                    logger.debug("WebSocket ping/pong test successful")
+                except asyncio.TimeoutError:
+                    logger.error("WebSocket ping test failed - connection appears dead")
+                    await self.websocket.close()
+                    return False
+                except Exception as e:
+                    logger.error(f"WebSocket ping test failed: {e}")
+                    await self.websocket.close()
+                    return False
                 
                 with self.lock:
                     self.running = True
@@ -561,15 +582,32 @@ class TunnelClient:
             except asyncio.CancelledError:
                 pass
             
+            # Ensure complete cleanup - close websocket properly
+            if self.websocket:
+                try:
+                    await self.websocket.close()
+                except Exception:
+                    pass
+            
             with self.lock:
                 self.websocket = None
-                # Clear connection-related state
+                # Clear ALL connection-related state for fresh restart
                 self.connection_start_time = None
                 self.last_keepalive = None
+                self.assigned_hostname = None
+                self.subdomain = None
 
     async def run(self):
         while self.running:
             try:
+                # Clean up any existing connection before reconnecting
+                if self.websocket:
+                    try:
+                        await self.websocket.close()
+                    except Exception:
+                        pass
+                    self.websocket = None
+                
                 if await self.connect():
                     # Connection successful
                     try:
@@ -584,11 +622,11 @@ class TunnelClient:
                 if not self.running:
                     break
                 
-                # Calculate reconnect delay with exponential backoff
+                # Calculate reconnect delay with exponential backoff (fixed calculation)
                 with self.lock:
-                    delay = min(self.reconnect_delay * (2 ** min(self.reconnect_attempts - 1, 5)), self.max_reconnect_delay)
+                    delay = min(self.reconnect_delay * (2 ** self.reconnect_attempts), self.max_reconnect_delay)
                 
-                logger.info(f"Reconnecting in {delay} seconds... (attempt {self.reconnect_attempts})")
+                logger.info(f"Reconnecting in {delay} seconds... (attempt {self.reconnect_attempts + 1})")
                 
                 # Use shorter sleep intervals to be more responsive to shutdown
                 sleep_intervals = int(delay * 10)  # 0.1 second intervals
@@ -600,6 +638,8 @@ class TunnelClient:
             except Exception as e:
                 logger.error(f"Unexpected error in run loop: {e}")
                 # Continue with reconnection logic
+                with self.lock:
+                    self.reconnect_attempts += 1
                 if not self.running:
                     break
                 await asyncio.sleep(1)
