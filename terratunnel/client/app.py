@@ -403,15 +403,23 @@ class TunnelClient:
             path = request_data.get("path", "/")
             headers = request_data.get("headers", {})
             query_params = request_data.get("query_params", {})
+            raw_query_string = request_data.get("raw_query_string", "")
             body = request_data.get("body", "")
-            
-            
+
+
             # Handle binary request body if present
             if request_data.get("is_binary") and body:
                 body = base64.b64decode(body)
-            
-            url = f"{self.local_url}{path}"
-            
+
+            # Build URL with raw query string if available, otherwise use params
+            if raw_query_string:
+                url = f"{self.local_url}{path}?{raw_query_string}"
+                # Don't pass params to avoid double encoding
+                query_params = None
+            else:
+                url = f"{self.local_url}{path}"
+                # Use parsed params (backward compatibility)
+
             async with httpx.AsyncClient() as client:
                 response = await client.request(
                     method=method,
