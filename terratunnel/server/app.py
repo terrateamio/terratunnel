@@ -2472,8 +2472,8 @@ async def proxy_request_streaming(request: Request, path: str):
         "method": request.method,
         "path": f"/{path}" if path else "/",
         "headers": dict(request.headers),
-        "query_params": dict(request.query_params),
-        "raw_query_string": str(request.url.query) if request.url.query else "",
+        "query_params": list(request.query_params.multi_items()),  # For list query params support
+        "raw_query_string": str(request.url.query) if request.url.query else "",  # For encoding preservation
     }
     
     if body:

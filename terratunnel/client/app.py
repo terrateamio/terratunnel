@@ -382,7 +382,12 @@ class TunnelClient:
             # Fallback to parsed params (backward compatibility)
             query_params = request_data.get("query_params", {})
             if query_params:
-                query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+                # Handle both dict (old format) and list of tuples (new format for multi-value params)
+                if isinstance(query_params, dict):
+                    query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+                else:
+                    # List of tuples format
+                    query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params])
                 path += query_str
         
         if self.request_logger:
