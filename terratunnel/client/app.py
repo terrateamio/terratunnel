@@ -373,12 +373,17 @@ class TunnelClient:
         method = request_data.get("method", "GET")
         path = request_data.get("path", "/")
         status_code = response_data.get("status_code", 0)
-        
-        # Add query string if present
-        query_params = request_data.get("query_params", {})
-        if query_params:
-            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
-            path += query_str
+
+        # Add query string if present - use raw_query_string if available for proper encoding display
+        raw_query_string = request_data.get("raw_query_string", "")
+        if raw_query_string:
+            path += "?" + raw_query_string
+        else:
+            # Fallback to parsed params (backward compatibility)
+            query_params = request_data.get("query_params", {})
+            if query_params:
+                query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+                path += query_str
         
         if self.request_logger:
             # Log full details to file and get request ID

@@ -52,12 +52,17 @@ class RequestLogger:
         # Request details
         method = request_data.get("method", "GET")
         path = request_data.get("path", "/")
-        query_params = request_data.get("query_params", {})
-        
-        # Add query string if present
-        if query_params:
-            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
-            path += query_str
+
+        # Add query string if present - use raw_query_string if available for proper encoding display
+        raw_query_string = request_data.get("raw_query_string", "")
+        if raw_query_string:
+            path += "?" + raw_query_string
+        else:
+            # Fallback to parsed params (backward compatibility)
+            query_params = request_data.get("query_params", {})
+            if query_params:
+                query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+                path += query_str
             
         log_lines.append(f"REQUEST: {method} {path}")
         
@@ -128,12 +133,17 @@ class RequestLogger:
         method = request_data.get("method", "GET")
         path = request_data.get("path", "/")
         status_code = response_data.get("status_code", 0)
-        
-        # Add query string if present
-        query_params = request_data.get("query_params", {})
-        if query_params:
-            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
-            path += query_str
+
+        # Add query string if present - use raw_query_string if available for proper encoding display
+        raw_query_string = request_data.get("raw_query_string", "")
+        if raw_query_string:
+            path += "?" + raw_query_string
+        else:
+            # Fallback to parsed params (backward compatibility)
+            query_params = request_data.get("query_params", {})
+            if query_params:
+                query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+                path += query_str
         
         # Format timestamp
         timestamp = datetime.now().strftime("%H:%M:%S")
