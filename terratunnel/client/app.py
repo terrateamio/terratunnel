@@ -21,7 +21,7 @@ import jwt
 from .request_logger import RequestLogger
 from ..utils import is_binary_content
 from ..streaming import (
-    ChunkedStreamer, StreamMessage, StreamMetadata, 
+    ChunkedStreamer, StreamMessage, StreamMetadata,
     STREAMING_THRESHOLD, DEFAULT_CHUNK_SIZE
 )
 
@@ -55,15 +55,15 @@ class TunnelClient:
         self.reconnect_delay = 1  # Initial reconnect delay in seconds
         self.max_reconnect_delay = 60  # Maximum reconnect delay
         self.reconnect_attempts = 0
-        
+
         # Initialize request logger (only if enabled)
         log_file = os.getenv("TERRATUNNEL_REQUEST_LOG")
         self.request_logger = RequestLogger() if log_file else None
-        
+
         parsed = urlparse(server_url)
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
         self.ws_url = f"{ws_scheme}://{parsed.netloc}/ws"
-        
+
         # Ensure local endpoint has a protocol
         if not local_endpoint.startswith(('http://', 'https://')):
             self.local_url = f"http://{local_endpoint}"
@@ -73,19 +73,19 @@ class TunnelClient:
     async def connect(self):
         try:
             logger.info(f"Connecting to tunnel server at {self.ws_url}...")
-            
+
             # Clean up any previous state before connecting
             with self.lock:
                 self.assigned_hostname = None
                 self.subdomain = None
                 self.connection_start_time = None
                 self.last_keepalive = None
-            
+
             # Prepare headers with API key if provided
             headers = {}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
-            
+
             # Add connection timeout and ping interval for better connection health monitoring
             self.websocket = await websockets.connect(
                 self.ws_url,
@@ -95,18 +95,18 @@ class TunnelClient:
                 close_timeout=10,  # Wait 10 seconds for close handshake
                 max_size=512 * 1024 * 1024  # 512MB max message size
             )
-            
+
             # Send local endpoint information to server
             endpoint_info = {
                 "type": "client_info",
                 "local_endpoint": self.local_endpoint
             }
-            
+
             # Add subdomain if specified (for admin users)
-            
+
             async with self.websocket_send_lock:
                 await self.websocket.send(json.dumps(endpoint_info))
-            
+
             # Wait for hostname assignment with timeout
             try:
                 hostname_message = await asyncio.wait_for(self.websocket.recv(), timeout=10.0)
@@ -114,13 +114,13 @@ class TunnelClient:
                 logger.error("Timeout waiting for hostname assignment from server")
                 await self.websocket.close()
                 return False
-                
+
             hostname_data = json.loads(hostname_message)
-            
+
             if hostname_data.get("type") == "hostname_assigned":
                 self.assigned_hostname = hostname_data.get("hostname")
                 self.subdomain = hostname_data.get("subdomain")
-                
+
                 # Test the connection with a WebSocket ping before declaring success
                 try:
                     pong_waiter = await self.websocket.ping()
@@ -134,30 +134,30 @@ class TunnelClient:
                     logger.error(f"WebSocket ping test failed: {e}")
                     await self.websocket.close()
                     return False
-                
+
                 with self.lock:
                     self.running = True
                     self.connection_start_time = datetime.now(timezone.utc)
                     self.last_keepalive = time.time()
                     self.reconnect_delay = 1  # Reset reconnect delay on successful connection
                     self.reconnect_attempts = 0
-                
+
                 logger.info(f"Tunnel ready! Access your local server at: https://{self.assigned_hostname}")
                 logger.info(f"Connected to tunnel server with hostname: {self.assigned_hostname}")
                 logger.info(f"Forwarding to local endpoint: {self.local_url}")
-                
+
                 # Automatically update GitHub webhook URL if flag is enabled and environment variables are set
                 if self.update_github_webhook and os.getenv("GITHUB_APP_ID") and os.getenv("GITHUB_APP_PEM"):
                     webhook_path = os.getenv("WEBHOOK_PATH", "/webhook")
                     await self.update_github_webhook_url(webhook_path)
-                
+
                 return True
             else:
                 logger.error("Did not receive hostname assignment from server")
                 if self.websocket:
                     await self.websocket.close()
                 return False
-                
+
         except websockets.exceptions.InvalidURI:
             logger.error(f"Invalid WebSocket URL: {self.ws_url}")
             return False
@@ -190,19 +190,20 @@ class TunnelClient:
         """Record webhook request and response for dashboard"""
         if not self.dashboard:
             return
-            
+
         webhook_record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "method": request_data.get("method", "GET"),
             "path": request_data.get("path", "/"),
             "headers": request_data.get("headers", {}),
             "query_params": request_data.get("query_params", {}),
+            "query_params_multi": request_data.get("query_params_multi", []),
             "body": request_data.get("body", ""),
             "response_status": response_data.get("status_code", 0),
             "response_headers": response_data.get("headers", {}),
             "response_body": response_data.get("body", "")
         }
-        
+
         with self.lock:
             self.webhook_history.insert(0, webhook_record)  # Insert at beginning
             if len(self.webhook_history) > self.max_history:
@@ -213,28 +214,28 @@ class TunnelClient:
         request_id = request_data.get("request_id", "unknown")
         method = request_data.get("method", "GET")
         path = request_data.get("path", "/")
-        
-        
+
+
         try:
             # Handle HTTP request and track duration
             start_time = time.time()
             response_data = await self.handle_request(request_data)
             duration_ms = (time.time() - start_time) * 1000
-            
-            
+
+
             # Log request with duration
             self._log_request(request_data, response_data, duration_ms)
-            
+
             # Include request_id in response if present
             if request_data.get("request_id"):
                 response_data["request_id"] = request_data["request_id"]
-            
+
             # Check if response needs streaming
             if response_data.get("is_streaming"):
-                
+
                 # Remove the response object before sending
                 streaming_response = response_data.pop("_streaming_response", None)
-                
+
                 # First send the initial response with streaming info
                 if self.websocket:
                     async with self.websocket_send_lock:
@@ -244,11 +245,11 @@ class TunnelClient:
                         else:
                             logger.warning(f"[{request_id}] WebSocket closed before sending initial streaming response")
                             return
-                
+
                 # Put the response back for streaming
                 if streaming_response:
                     response_data["_streaming_response"] = streaming_response
-                
+
                 # Now stream the actual content
                 await self._stream_response_content(request_id, response_data)
             else:
@@ -260,7 +261,7 @@ class TunnelClient:
                             await self.websocket.send(json.dumps(response_data))
                         else:
                             logger.warning(f"[{request_id}] WebSocket closed before sending response")
-                
+
         except Exception as e:
             logger.error(f"Error processing request: {e}")
             # Send error response if possible
@@ -284,46 +285,46 @@ class TunnelClient:
         stream_info = response_data.get("stream", {})
         stream_id = stream_info.get("id")
         response = response_data.get("_streaming_response")
-        
-        
+
+
         if not response:
             logger.error(f"[CLIENT-STREAM] No response object found for streaming")
             return
-        
+
         content_size = stream_info.get("total_size", 0)
-        
+
         try:
-            
+
             # Read content once to avoid multiple accesses
             response_content = response.content
-            
+
             # Verify we actually have content
             if not response_content:
                 logger.error(f"[CLIENT-STREAM] ERROR: Response content is empty! Cannot stream empty content.")
                 logger.error(f"[CLIENT-STREAM] Response object: {response}")
                 logger.error(f"[CLIENT-STREAM] Response headers: {getattr(response, 'headers', 'N/A')}")
                 return
-            
+
             # Create streamer
             streamer = ChunkedStreamer(chunk_size=DEFAULT_CHUNK_SIZE)
-            
+
             # Stream the response content
             chunk_count = 0
-            
+
             # Update keepalive timestamp during streaming to prevent timeout
             with self.lock:
                 self.last_keepalive = time.time()
-            
+
             async for chunk_message in streamer.stream_bytes(response_content, stream_id):
                 if self.websocket:
                     message_type = chunk_message.get("type")
-                    
+
                     # Log the actual message being sent
                     if message_type == "stream_chunk":
                         chunk_info = chunk_message.get("chunk", {})
-                    
+
                     message_json = json.dumps(chunk_message)
-                    
+
                     async with self.websocket_send_lock:
                         # Check again inside the lock to prevent race condition
                         if self.websocket:
@@ -331,20 +332,20 @@ class TunnelClient:
                         else:
                             logger.error(f"[CLIENT-STREAM] WebSocket closed during streaming, aborting stream {stream_id}")
                             break
-                    
+
                     if message_type == "stream_chunk":
                         chunk_count += 1
                         chunk_info = chunk_message.get("chunk", {})
-                        
+
                         # Update keepalive timestamp every 10 chunks to prevent timeout
                         if chunk_count % 10 == 0:
                             with self.lock:
                                 self.last_keepalive = time.time()
-                            
+
                     elif message_type == "stream_complete":
                         logger.info(f"Stream {stream_id} completed: sent {chunk_count} chunks")
-            
-            
+
+
         except Exception as e:
             logger.error(f"[{request_id}] Error during streaming: {e}")
             # Send error message
@@ -356,7 +357,7 @@ class TunnelClient:
                         await self.websocket.send(json.dumps(error_msg))
                     else:
                         logger.warning(f"[CLIENT-STREAM] Cannot send error message - WebSocket closed")
-        
+
         finally:
             # Clean up the response object from response_data
             if "_streaming_response" in response_data:
@@ -364,26 +365,26 @@ class TunnelClient:
 
     def _log_request(self, request_data: dict, response_data: dict, duration_ms: Optional[float] = None):
         """Log request to file (if enabled) and display access log to console.
-        
+
         Args:
             request_data: Request details
-            response_data: Response details  
+            response_data: Response details
             duration_ms: Request duration in milliseconds (optional)
         """
         method = request_data.get("method", "GET")
         path = request_data.get("path", "/")
         status_code = response_data.get("status_code", 0)
-        
+
         # Add query string if present
-        query_params = request_data.get("query_params", {})
+        query_params = request_data.get("query_params_multi", [])
         if query_params:
-            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params])
             path += query_str
-        
+
         if self.request_logger:
             # Log full details to file and get request ID
             request_id = self.request_logger.log_request(request_data, response_data)
-            
+
             # Display concise access log to console with request ID
             access_log = self.request_logger.format_access_log(
                 request_data, response_data, request_id, duration_ms
@@ -402,16 +403,16 @@ class TunnelClient:
             method = request_data.get("method", "GET")
             path = request_data.get("path", "/")
             headers = request_data.get("headers", {})
-            query_params = request_data.get("query_params", {})
+            query_params = request_data.get("query_params_multi", [])
             body = request_data.get("body", "")
-            
-            
+
+
             # Handle binary request body if present
             if request_data.get("is_binary") and body:
                 body = base64.b64decode(body)
-            
+
             url = f"{self.local_url}{path}"
-            
+
             async with httpx.AsyncClient() as client:
                 response = await client.request(
                     method=method,
@@ -421,23 +422,23 @@ class TunnelClient:
                     content=body,
                     timeout=600.0  # 10 minutes for large files
                 )
-                
+
                 # Check if response is binary based on content-type
                 content_type = response.headers.get("content-type", "").lower()
                 is_binary = is_binary_content(content_type)
-                
+
                 response_data = {
                     "status_code": response.status_code,
                     "headers": dict(response.headers),
                 }
-                
+
                 # Check response size before encoding
                 # Base64 encoding increases size by ~33%, so we need to account for that
                 # Plus JSON overhead and WebSocket framing
                 # Default: 50MB raw data (will be ~67MB encoded)
                 # This conservative limit prevents server OOM issues
                 MAX_RESPONSE_SIZE = int(os.environ.get('TERRATUNNEL_MAX_RESPONSE_SIZE', str(50 * 1024 * 1024)))
-                
+
                 if is_binary:
                     # Check content length from headers first
                     content_length = response.headers.get("content-length")
@@ -448,22 +449,22 @@ class TunnelClient:
                         # No Content-Length header - always stream to avoid loading entire response
                         content_size = 0  # Unknown size
                         use_streaming = True
-                    
-                    
+
+
                     # Use streaming for large files or when size is unknown
                     if use_streaming:
                         if content_size > 0:
                             logger.info(f"[{request_id}] Large response ({content_size} bytes > {STREAMING_THRESHOLD} threshold), using streaming")
                         else:
                             logger.info(f"[{request_id}] Response size unknown (no Content-Length header), using streaming")
-                        
+
                         stream_id = str(uuid.uuid4())
-                        
+
                         # Calculate actual content size once
                         actual_content_size = content_size
                         if content_size <= 0 and hasattr(response, 'content'):
                             actual_content_size = len(response.content)
-                        
+
                         # Send initial response with streaming info
                         response_data["body"] = ""
                         response_data["is_binary"] = True
@@ -473,19 +474,19 @@ class TunnelClient:
                             "total_size": actual_content_size,
                             "content_type": content_type
                         }
-                        
-                        
+
+
                         # Return response data with streaming flag
                         # The initial response will be sent by _process_request
                         response_data["_streaming_response"] = response  # Store for later streaming
                         return response_data
-                    
+
                     # For smaller files, use regular encoding
                     response_data["body"] = base64.b64encode(response.content).decode('ascii')
                     response_data["is_binary"] = True
                 else:
                     text_size = len(response.text.encode('utf-8'))
-                    
+
                     if text_size > MAX_RESPONSE_SIZE:
                         logger.error(f"[{request_id}] Response too large: {text_size} bytes exceeds {MAX_RESPONSE_SIZE} bytes limit")
                         size_mb = text_size / (1024 * 1024)
@@ -496,15 +497,15 @@ class TunnelClient:
                             "body": f"Response too large: {size_mb:.1f}MB exceeds maximum allowed size of {max_mb:.1f}MB. Terratunnel currently does not support streaming large files.",
                             "is_binary": False
                         }
-                    
+
                     response_data["body"] = response.text
                     response_data["is_binary"] = False
-                
+
                 # Record webhook for dashboard
                 self._record_webhook(request_data, response_data)
-                
+
                 return response_data
-                
+
         except Exception as e:
             logger.error(f"Error handling local request: {e}")
             error_response = {
@@ -513,19 +514,19 @@ class TunnelClient:
                 "body": f"Internal server error: {str(e)}",
                 "is_binary": False
             }
-            
+
             # Record error for dashboard
             self._record_webhook(request_data, error_response)
-            
+
             return error_response
-    
+
 
     async def monitor_keepalive(self):
         """Monitor keepalive messages and detect connection failures"""
         while self.running and self.websocket:
             try:
                 await asyncio.sleep(5)  # Check every 5 seconds
-                
+
                 with self.lock:
                     if self.last_keepalive and time.time() - self.last_keepalive > self.keepalive_timeout:
                         logger.warning(f"No keepalive received for {self.keepalive_timeout} seconds, connection may be dead")
@@ -540,21 +541,21 @@ class TunnelClient:
     async def listen(self):
         # Start keepalive monitor in background
         monitor_task = asyncio.create_task(self.monitor_keepalive())
-        
+
         try:
             while self.running:
                 try:
                     if not self.websocket:
                         break
-                    
+
                     # Use timeout to make recv() interruptible
                     try:
                         message = await asyncio.wait_for(self.websocket.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
                         continue
-                        
+
                     request_data = json.loads(message)
-                    
+
                     if request_data.get("type") == "keepalive":
                         async with self.websocket_send_lock:
                             # Check if websocket is still available
@@ -563,11 +564,11 @@ class TunnelClient:
                         with self.lock:
                             self.last_keepalive = time.time()
                         continue
-                    
+
                     # Handle HTTP request concurrently
                     request_id = request_data.get("request_id", "unknown")
                     task = asyncio.create_task(self._process_request(request_data))
-                        
+
                 except websockets.exceptions.ConnectionClosed:
                     logger.info("WebSocket connection closed")
                     break
@@ -581,14 +582,14 @@ class TunnelClient:
                 await monitor_task
             except asyncio.CancelledError:
                 pass
-            
+
             # Ensure complete cleanup - close websocket properly
             if self.websocket:
                 try:
                     await self.websocket.close()
                 except Exception:
                     pass
-            
+
             with self.lock:
                 self.websocket = None
                 # Clear ALL connection-related state for fresh restart
@@ -607,7 +608,7 @@ class TunnelClient:
                     except Exception:
                         pass
                     self.websocket = None
-                
+
                 if await self.connect():
                     # Connection successful
                     try:
@@ -618,23 +619,23 @@ class TunnelClient:
                     # Connection failed
                     with self.lock:
                         self.reconnect_attempts += 1
-                
+
                 if not self.running:
                     break
-                
+
                 # Calculate reconnect delay with exponential backoff (fixed calculation)
                 with self.lock:
                     delay = min(self.reconnect_delay * (2 ** self.reconnect_attempts), self.max_reconnect_delay)
-                
+
                 logger.info(f"Reconnecting in {delay} seconds... (attempt {self.reconnect_attempts + 1})")
-                
+
                 # Use shorter sleep intervals to be more responsive to shutdown
                 sleep_intervals = int(delay * 10)  # 0.1 second intervals
                 for _ in range(sleep_intervals):
                     if not self.running:
                         break
                     await asyncio.sleep(0.1)
-                    
+
             except Exception as e:
                 logger.error(f"Unexpected error in run loop: {e}")
                 # Continue with reconnection logic
@@ -647,7 +648,7 @@ class TunnelClient:
     def stop(self):
         with self.lock:
             self.running = False
-    
+
     async def stop_async(self):
         self.stop()
         if self.websocket:
@@ -660,12 +661,12 @@ class TunnelClient:
         """Update GitHub application webhook URL with the tunnel endpoint"""
         try:
             logger.info("Updating the GitHub application webhook url")
-            
+
             # Get required environment variables
             github_app_id = os.getenv("GITHUB_APP_ID")
             github_app_pem = os.getenv("GITHUB_APP_PEM")
             github_api_endpoint = os.getenv("GITHUB_API_ENDPOINT", "https://api.github.com")
-            
+
             # Handle escaped newlines in PEM key
             if github_app_pem and "\\n" in github_app_pem:
                 github_app_pem = github_app_pem.replace("\\n", "\n")
@@ -673,19 +674,19 @@ class TunnelClient:
             if not github_app_id:
                 logger.error("GITHUB_APP_ID environment variable not set")
                 return False
-                
+
             if not github_app_pem:
                 logger.error("GITHUB_APP_PEM environment variable not set")
                 return False
-                
+
             if not self.assigned_hostname:
                 logger.error("No tunnel hostname assigned yet")
                 return False
-            
+
             # Construct the webhook URL using tunnel address
             webhook_url = f"https://{self.assigned_hostname}{webhook_path}"
             logger.info(f"Setting webhook URL to: {webhook_url}")
-            
+
             # Create JWT payload with issue and expiry time
             current_time = int(time.time())
             jwt_payload = {
@@ -693,10 +694,10 @@ class TunnelClient:
                 "exp": current_time + 300,  # 5 minutes
                 "iss": github_app_id
             }
-            
+
             # Encode the JWT using the private key
             jwt_token = jwt.encode(jwt_payload, github_app_pem, algorithm="RS256")
-            
+
             # Set request headers with JWT token
             headers = {
                 "Content-Type": "application/json",
@@ -704,13 +705,13 @@ class TunnelClient:
                 "Accept": "application/vnd.github.v3+json",
                 "User-Agent": "Terratunnel/1.0"
             }
-            
+
             # Define payload with new webhook configuration
             webhook_payload = {
                 "content_type": "json",
                 "url": webhook_url
             }
-            
+
             # Send PATCH request to GitHub API to update webhook
             async with httpx.AsyncClient() as client:
                 response = await client.patch(
@@ -719,7 +720,7 @@ class TunnelClient:
                     headers=headers,
                     timeout=30.0
                 )
-                
+
                 if response.status_code == 200:
                     logger.info("GitHub webhook URL updated successfully")
                     logger.info(f"Response: {response.text}")
@@ -728,7 +729,7 @@ class TunnelClient:
                     logger.error(f"Failed to update GitHub webhook URL: {response.status_code}")
                     logger.error(f"Response: {response.text}")
                     return False
-                    
+
         except jwt.InvalidKeyError:
             logger.error("Invalid GitHub App private key format")
             return False
@@ -745,11 +746,11 @@ class TunnelClient:
     def create_dashboard_app(self) -> FastAPI:
         """Create FastAPI dashboard application"""
         dashboard_app = FastAPI(title="Terratunnel Dashboard")
-        
+
         @dashboard_app.get("/", response_class=HTMLResponse)
         async def dashboard():
             return self._generate_dashboard_html()
-        
+
         @dashboard_app.get("/api/webhooks")
         async def get_webhooks():
             with self.lock:
@@ -758,7 +759,7 @@ class TunnelClient:
                     "total": len(self.webhook_history),
                     "tunnel_hostname": self.assigned_hostname
                 }
-        
+
         @dashboard_app.get("/api/status")
         async def get_status():
             connected = self.websocket is not None and not self.websocket.closed
@@ -769,16 +770,16 @@ class TunnelClient:
                 "local_endpoint": self.local_endpoint,
                 "webhook_count": len(self.webhook_history)
             }
-        
+
         @dashboard_app.post("/api/retry/{webhook_index}")
         async def retry_webhook(webhook_index: int):
             try:
                 with self.lock:
                     if webhook_index < 0 or webhook_index >= len(self.webhook_history):
                         return {"success": False, "error": "Invalid webhook index"}
-                    
+
                     webhook = self.webhook_history[webhook_index]
-                
+
                 # Reconstruct the original request data
                 request_data = {
                     "method": webhook["method"],
@@ -787,27 +788,27 @@ class TunnelClient:
                     "query_params": webhook["query_params"],
                     "body": webhook["body"]
                 }
-                
+
                 # Retry the request
                 response_data = await self.handle_request(request_data)
-                
+
                 return {
                     "success": True,
                     "original_status": webhook["response_status"],
                     "new_status": response_data["status_code"],
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 }
-                
+
             except Exception as e:
                 logger.error(f"Error retrying webhook {webhook_index}: {e}")
                 return {"success": False, "error": str(e)}
-        
+
         return dashboard_app
-    
+
     def create_api_app(self) -> FastAPI:
         """Create simple JSON API application"""
         api_app = FastAPI(title="Terratunnel Client API", version="1.0.0")
-        
+
         @api_app.get("/status")
         async def get_status():
             """Get current client status"""
@@ -815,9 +816,9 @@ class TunnelClient:
                 uptime_seconds = None
                 if self.connection_start_time:
                     uptime_seconds = (datetime.now(timezone.utc) - self.connection_start_time).total_seconds()
-                
+
                 connected = self.websocket is not None and not self.websocket.closed
-                
+
                 return {
                     "running": self.running,
                     "connected": connected,
@@ -830,7 +831,7 @@ class TunnelClient:
                     "reconnect_attempts": self.reconnect_attempts,
                     "last_keepalive_ago": time.time() - self.last_keepalive if self.last_keepalive else None
                 }
-        
+
         @api_app.get("/webhooks")
         async def get_webhooks(limit: int = 10):
             """Get recent webhooks"""
@@ -841,7 +842,7 @@ class TunnelClient:
                     "total_count": len(self.webhook_history),
                     "limit": limit
                 }
-        
+
         @api_app.get("/webhooks/stats")
         async def get_webhook_stats():
             """Get webhook statistics"""
@@ -853,32 +854,32 @@ class TunnelClient:
                         "methods": {},
                         "latest_webhook": None
                     }
-                
+
                 # Count status codes and methods
                 status_codes = {}
                 methods = {}
-                
+
                 for webhook in self.webhook_history:
                     status = webhook.get("response_status", 0)
                     method = webhook.get("method", "UNKNOWN")
-                    
+
                     status_codes[str(status)] = status_codes.get(str(status), 0) + 1
                     methods[method] = methods.get(method, 0) + 1
-                
+
                 return {
                     "total_count": len(self.webhook_history),
                     "status_codes": status_codes,
                     "methods": methods,
                     "latest_webhook": self.webhook_history[0] if self.webhook_history else None
                 }
-        
+
         @api_app.get("/health")
         async def health_check():
             """Simple health check"""
             return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
-        
+
         return api_app
-    
+
     def _generate_dashboard_html(self) -> str:
         """Generate HTML dashboard"""
         return '''
@@ -890,52 +891,52 @@ class TunnelClient:
     <title>Terratunnel Dashboard</title>
     <style>
         * { box-sizing: border-box; }
-        
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; 
-            margin: 0; 
-            padding: 20px; 
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            margin: 0;
+            padding: 20px;
             background: #f8f9fa;
             min-height: 100vh;
             color: #212529;
             line-height: 1.5;
         }
-        
-        .container { 
-            max-width: 1200px; 
-            margin: 0 auto; 
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
         }
-        
-        .header { 
-            background: white; 
-            padding: 2rem; 
-            border-radius: 8px; 
-            margin-bottom: 1.5rem; 
+
+        .header {
+            background: white;
+            padding: 2rem;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
             border: 1px solid #dee2e6;
         }
-        
-        .header h1 { 
-            margin: 0 0 1.5rem 0; 
-            font-size: 2rem; 
-            font-weight: 600; 
+
+        .header h1 {
+            margin: 0 0 1.5rem 0;
+            font-size: 2rem;
+            font-weight: 600;
             color: #212529;
         }
-        
+
         .status-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 1rem;
             margin-bottom: 1.5rem;
         }
-        
+
         .status-item {
             background: #f8f9fa;
             padding: 1rem;
             border-radius: 6px;
             border: 1px solid #e9ecef;
         }
-        
+
         .status-item strong {
             display: block;
             font-size: 0.875rem;
@@ -945,69 +946,69 @@ class TunnelClient:
             letter-spacing: 0.05em;
             font-weight: 500;
         }
-        
+
         .status-value {
             font-size: 1rem;
             font-weight: 600;
             color: #212529;
         }
-        
+
         .status-connected { color: #198754; }
         .status-disconnected { color: #dc3545; }
-        
+
         .controls {
             display: flex;
             gap: 0.75rem;
             align-items: center;
         }
-        
-        .refresh-btn { 
-            background: #0d6efd; 
-            color: white; 
-            border: none; 
-            padding: 0.5rem 1rem; 
-            border-radius: 6px; 
-            cursor: pointer; 
+
+        .refresh-btn {
+            background: #0d6efd;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
             font-weight: 500;
             font-size: 0.875rem;
             transition: background-color 0.15s ease;
         }
-        
-        .refresh-btn:hover { 
+
+        .refresh-btn:hover {
             background: #0b5ed7;
         }
-        
-        .webhook-list { 
-            background: white; 
-            padding: 2rem; 
-            border-radius: 8px; 
+
+        .webhook-list {
+            background: white;
+            padding: 2rem;
+            border-radius: 8px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
             border: 1px solid #dee2e6;
         }
-        
+
         .webhook-list h2 {
             margin: 0 0 1.5rem 0;
             font-size: 1.5rem;
             font-weight: 600;
             color: #212529;
         }
-        
-        .webhook-item { 
+
+        .webhook-item {
             background: white;
-            border: 1px solid #dee2e6; 
-            margin-bottom: 1rem; 
-            border-radius: 6px; 
+            border: 1px solid #dee2e6;
+            margin-bottom: 1rem;
+            border-radius: 6px;
             overflow: hidden;
             transition: box-shadow 0.15s ease;
         }
-        
+
         .webhook-item:hover {
             box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         }
-        
-        .webhook-header { 
-            background: #f8f9fa; 
-            padding: 1rem; 
+
+        .webhook-header {
+            background: #f8f9fa;
+            padding: 1rem;
             cursor: pointer;
             transition: background-color 0.15s ease;
             display: flex;
@@ -1015,11 +1016,11 @@ class TunnelClient:
             gap: 1rem;
             flex-wrap: wrap;
         }
-        
+
         .webhook-header:hover {
             background: #e9ecef;
         }
-        
+
         .webhook-main-info {
             display: flex;
             align-items: center;
@@ -1027,38 +1028,38 @@ class TunnelClient:
             flex: 1;
             min-width: 0;
         }
-        
+
         .webhook-actions {
             display: flex;
             align-items: center;
             gap: 0.75rem;
         }
-        
-        .webhook-details { 
-            padding: 1.5rem; 
-            display: none; 
+
+        .webhook-details {
+            padding: 1.5rem;
+            display: none;
             background: #fafbfc;
             border-top: 1px solid #dee2e6;
         }
-        
-        .method { 
-            padding: 0.25rem 0.75rem; 
-            border-radius: 4px; 
-            color: white; 
-            font-weight: 600; 
+
+        .method {
+            padding: 0.25rem 0.75rem;
+            border-radius: 4px;
+            color: white;
+            font-weight: 600;
             font-size: 0.75rem;
             text-transform: uppercase;
             letter-spacing: 0.05em;
             min-width: 60px;
             text-align: center;
         }
-        
+
         .method.GET { background: #198754; }
         .method.POST { background: #0d6efd; }
         .method.PUT { background: #fd7e14; }
         .method.DELETE { background: #dc3545; }
         .method.PATCH { background: #6f42c1; }
-        
+
         .webhook-path {
             font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
             font-weight: 500;
@@ -1066,7 +1067,7 @@ class TunnelClient:
             color: #495057;
             word-break: break-all;
         }
-        
+
         .status-badge {
             padding: 0.25rem 0.5rem;
             border-radius: 4px;
@@ -1075,67 +1076,67 @@ class TunnelClient:
             min-width: 50px;
             text-align: center;
         }
-        
+
         .status-200 { background: #d1e7dd; color: #0f5132; }
         .status-300 { background: #fff3cd; color: #664d03; }
         .status-400 { background: #f8d7da; color: #58151c; }
         .status-500 { background: #e2e3f0; color: #41464b; }
-        
-        .timestamp { 
-            color: #6c757d; 
-            font-size: 0.75rem; 
+
+        .timestamp {
+            color: #6c757d;
+            font-size: 0.75rem;
             font-weight: 400;
             width: 100%;
             margin-top: 0.5rem;
         }
-        
-        .retry-btn { 
-            background: #198754; 
-            color: white; 
-            border: none; 
-            padding: 0.375rem 0.75rem; 
-            border-radius: 4px; 
-            cursor: pointer; 
-            font-size: 0.75rem; 
+
+        .retry-btn {
+            background: #198754;
+            color: white;
+            border: none;
+            padding: 0.375rem 0.75rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.75rem;
             font-weight: 500;
             transition: background-color 0.15s ease;
         }
-        
-        .retry-btn:hover { 
+
+        .retry-btn:hover {
             background: #157347;
         }
-        
-        .retry-btn:disabled { 
-            background: #6c757d; 
-            cursor: not-allowed; 
+
+        .retry-btn:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
         }
-        
-        .retry-status { 
-            margin: 1rem 0; 
-            padding: 0.75rem; 
-            border-radius: 6px; 
-            font-size: 0.875rem; 
+
+        .retry-status {
+            margin: 1rem 0;
+            padding: 0.75rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
         }
-        
-        .retry-success { 
-            background: #d1e7dd; 
-            color: #0f5132; 
-            border: 1px solid #a3cfbb; 
+
+        .retry-success {
+            background: #d1e7dd;
+            color: #0f5132;
+            border: 1px solid #a3cfbb;
         }
-        
-        .retry-error { 
-            background: #f8d7da; 
-            color: #58151c; 
-            border: 1px solid #f1aeb5; 
+
+        .retry-error {
+            background: #f8d7da;
+            color: #58151c;
+            border: 1px solid #f1aeb5;
         }
-        
-        .no-webhooks { 
-            text-align: center; 
-            color: #6c757d; 
+
+        .no-webhooks {
+            text-align: center;
+            color: #6c757d;
             padding: 3rem 1rem;
             font-size: 1rem;
         }
-        
+
         .section-title {
             font-size: 0.875rem;
             font-weight: 600;
@@ -1144,30 +1145,30 @@ class TunnelClient:
             text-transform: uppercase;
             letter-spacing: 0.05em;
         }
-        
-        pre { 
-            background: #f1f3f4; 
-            padding: 1rem; 
-            border-radius: 6px; 
-            overflow-x: auto; 
-            white-space: pre-wrap; 
+
+        pre {
+            background: #f1f3f4;
+            padding: 1rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            white-space: pre-wrap;
             font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
             font-size: 0.8125rem;
             line-height: 1.4;
             border: 1px solid #dee2e6;
             margin: 0.5rem 0;
         }
-        
+
         .expand-indicator {
             transition: transform 0.15s ease;
             font-size: 0.75rem;
             color: #6c757d;
         }
-        
+
         .webhook-header.expanded .expand-indicator {
             transform: rotate(90deg);
         }
-        
+
         @media (max-width: 768px) {
             body { padding: 1rem; }
             .header { padding: 1.5rem; }
@@ -1188,7 +1189,7 @@ class TunnelClient:
                 <button class="refresh-btn" onclick="loadWebhooks()">Refresh</button>
             </div>
         </div>
-        
+
         <div class="webhook-list">
             <h2>Webhook History</h2>
             <div id="webhooks">Loading webhooks...</div>
@@ -1242,14 +1243,14 @@ class TunnelClient:
                 const data = await response.json();
                 console.log('Webhooks data:', data);
                 const webhooksDiv = document.getElementById('webhooks');
-                
+
                 if (data.webhooks.length === 0) {
                     webhooksDiv.innerHTML = '<div class="no-webhooks">No webhooks received yet<br><small>Webhook requests will appear here as they come in</small></div>';
                     expandedItems.clear();
                     lastWebhookCount = 0;
                     return;
                 }
-                
+
                 // Only re-render if webhook count changed
                 if (data.webhooks.length !== lastWebhookCount) {
                     webhooksDiv.innerHTML = data.webhooks.map((webhook, index) => `
@@ -1272,23 +1273,23 @@ class TunnelClient:
                             </div>
                             <div class="webhook-details" id="details-${index}" style="display: ${expandedItems.has(index) ? 'block' : 'none'}">
                                 <div id="retry-status-${index}"></div>
-                                
+
                                 <div class="section-title">Request Headers</div>
                                 <pre>${JSON.stringify(webhook.headers, null, 2)}</pre>
-                                
+
                                 ${webhook.query_params && Object.keys(webhook.query_params).length > 0 ? `
                                 <div class="section-title">Query Parameters</div>
                                 <pre>${JSON.stringify(webhook.query_params, null, 2)}</pre>
                                 ` : ''}
-                                
+
                                 ${webhook.body ? `
                                 <div class="section-title">Request Body</div>
                                 <pre>${webhook.body}</pre>
                                 ` : ''}
-                                
+
                                 <div class="section-title">Response Headers</div>
                                 <pre>${JSON.stringify(webhook.response_headers, null, 2)}</pre>
-                                
+
                                 ${webhook.response_body ? `
                                 <div class="section-title">Response Body</div>
                                 <pre>${webhook.response_body.substring(0, 1000)}${webhook.response_body.length > 1000 ? '\\n\\n... (truncated)' : ''}</pre>
@@ -1296,21 +1297,21 @@ class TunnelClient:
                             </div>
                         </div>
                     `).join('');
-                    
+
                     lastWebhookCount = data.webhooks.length;
                 }
-                
+
                 await loadStatus();
             } catch (error) {
                 console.error('Error loading webhooks:', error);
                 document.getElementById('webhooks').innerHTML = '<div class="no-webhooks">Error loading webhooks</div>';
             }
         }
-        
+
         function toggleDetails(index) {
             const details = document.getElementById(`details-${index}`);
             const header = details.previousElementSibling;
-            
+
             if (expandedItems.has(index)) {
                 details.style.display = 'none';
                 header.classList.remove('expanded');
@@ -1321,19 +1322,19 @@ class TunnelClient:
                 expandedItems.add(index);
             }
         }
-        
+
         async function retryWebhook(index, event) {
             // Prevent the click from triggering toggleDetails
             event.stopPropagation();
-            
+
             const retryBtn = document.getElementById(`retry-btn-${index}`);
             const retryStatus = document.getElementById(`retry-status-${index}`);
-            
+
             // Disable button and show loading state
             retryBtn.disabled = true;
             retryBtn.textContent = 'Retrying...';
             retryStatus.innerHTML = '';
-            
+
             try {
                 const response = await fetch(`/api/retry/${index}`, {
                     method: 'POST',
@@ -1341,27 +1342,27 @@ class TunnelClient:
                         'Content-Type': 'application/json'
                     }
                 });
-                
+
                 const result = await response.json();
-                
+
                 if (result.success) {
-                    const statusChange = result.original_status !== result.new_status ? 
-                        ` (${result.original_status} → ${result.new_status})` : 
+                    const statusChange = result.original_status !== result.new_status ?
+                        ` (${result.original_status} → ${result.new_status})` :
                         ` (${result.new_status})`;
-                    
+
                     retryStatus.innerHTML = `
                         <div class="retry-status retry-success">
                             ✓ Webhook retried successfully${statusChange}
                             <br><small>Retried at: ${new Date(result.timestamp).toLocaleString()}</small>
                         </div>
                     `;
-                    
+
                     // Auto-expand details to show retry status
                     if (!expandedItems.has(index)) {
                         expandedItems.add(index);
                         document.getElementById(`details-${index}`).style.display = 'block';
                     }
-                    
+
                 } else {
                     retryStatus.innerHTML = `
                         <div class="retry-status retry-error">
@@ -1369,7 +1370,7 @@ class TunnelClient:
                         </div>
                     `;
                 }
-                
+
             } catch (error) {
                 console.error('Error retrying webhook:', error);
                 retryStatus.innerHTML = `
@@ -1383,22 +1384,22 @@ class TunnelClient:
                 retryBtn.textContent = 'Retry';
             }
         }
-        
+
         // Add global error handler for better debugging
         window.addEventListener('error', function(e) {
             console.error('Global error:', e.error);
             console.error('File:', e.filename, 'Line:', e.lineno, 'Column:', e.colno);
         });
-        
+
         // Add unhandled promise rejection handler
         window.addEventListener('unhandledrejection', function(e) {
             console.error('Unhandled promise rejection:', e.reason);
         });
-        
+
         // Load data on page load
         console.log('Dashboard initializing...');
         loadWebhooks();
-        
+
         // Auto-refresh every 5 seconds
         setInterval(function() {
             console.log('Auto-refreshing webhooks...');
@@ -1412,48 +1413,48 @@ class TunnelClient:
 
 async def main_client(server_url: str, local_endpoint: str, dashboard: bool = False, dashboard_port: int = 8080, api_port: int = 8081, update_github_webhook: bool = False, api_key: Optional[str] = None):
     logger.info(f"Starting tunnel client - local endpoint: {local_endpoint}")
-    
+
     client = TunnelClient(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key)
     servers = []
     server_tasks = []
-    
+
     # Set up signal handlers
     shutdown_event = asyncio.Event()
     force_exit = False
-    
+
     def signal_handler(signum, frame):
         nonlocal force_exit
         if force_exit:
             # Second Ctrl+C, force immediate exit
             logger.info("Force exit!")
             os._exit(1)
-        
+
         force_exit = True
         logger.info("Shutting down... (Press Ctrl+C again to force quit)")
-        
+
         # Stop the client
         client.stop()
-        
+
         # Stop all servers
         for server in servers:
             server.should_exit = True
-        
+
         # Set shutdown event
         shutdown_event.set()
-        
+
         # Force exit after 1 second
         def force_shutdown():
             logger.warning("Shutdown timeout, forcing exit...")
             os._exit(1)
-        
+
         import threading
         timer = threading.Timer(1.0, force_shutdown)
         timer.daemon = True
         timer.start()
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     try:
         # Start dashboard and API servers if enabled
         if dashboard or True:  # Always start API server
@@ -1468,7 +1469,7 @@ async def main_client(server_url: str, local_endpoint: str, dashboard: bool = Fa
             )
             api_server = uvicorn.Server(api_config)
             servers.append(api_server)
-            
+
             if dashboard:
                 dashboard_app = client.create_dashboard_app()
                 dashboard_config = uvicorn.Config(
@@ -1481,7 +1482,7 @@ async def main_client(server_url: str, local_endpoint: str, dashboard: bool = Fa
                 )
                 dashboard_server = uvicorn.Server(dashboard_config)
                 servers.append(dashboard_server)
-        
+
         # Start servers in background tasks
         server_tasks = []
         for server in servers:
@@ -1489,21 +1490,21 @@ async def main_client(server_url: str, local_endpoint: str, dashboard: bool = Fa
             server.install_signal_handlers = lambda: None
             task = asyncio.create_task(server.serve())
             server_tasks.append(task)
-        
+
         if dashboard:
             logger.info(f"Dashboard available at: http://localhost:{dashboard_port}")
         logger.info(f"API available at: http://localhost:{api_port}")
-        
+
         # Run the main client with shutdown monitoring
         client_task = asyncio.create_task(client.run())
         shutdown_task = asyncio.create_task(shutdown_event.wait())
-        
+
         # Wait for either client to finish or shutdown signal
         done, pending = await asyncio.wait(
             {client_task, shutdown_task},
             return_when=asyncio.FIRST_COMPLETED
         )
-        
+
         # Cancel the other task
         for task in pending:
             task.cancel()
@@ -1511,18 +1512,18 @@ async def main_client(server_url: str, local_endpoint: str, dashboard: bool = Fa
                 await task
             except asyncio.CancelledError:
                 pass
-        
+
     finally:
         logger.info("Cleaning up...")
         client.stop()
-        
+
         # Stop servers gracefully
         for server in servers:
             server.should_exit = True
-        
+
         # Give servers a moment to shutdown cleanly
         await asyncio.sleep(0.1)
-        
+
         # Cancel any remaining server tasks
         for task in server_tasks:
             if not task.done():
@@ -1531,7 +1532,7 @@ async def main_client(server_url: str, local_endpoint: str, dashboard: bool = Fa
                     await asyncio.wait_for(task, timeout=0.5)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
-        
+
         if client.websocket:
             try:
                 await client.websocket.close()
@@ -1544,7 +1545,7 @@ def run_client(server_url: str, local_endpoint: str, dashboard: bool = False, da
     if request_log:
         import os
         os.environ['TERRATUNNEL_REQUEST_LOG'] = request_log
-    
+
     try:
         asyncio.run(main_client(server_url, local_endpoint, dashboard, dashboard_port, api_port, update_github_webhook, api_key))
     except KeyboardInterrupt:
