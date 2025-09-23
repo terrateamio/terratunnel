@@ -373,22 +373,12 @@ class TunnelClient:
         method = request_data.get("method", "GET")
         path = request_data.get("path", "/")
         status_code = response_data.get("status_code", 0)
-
-        # Add query string if present - use raw_query_string if available for proper encoding display
-        raw_query_string = request_data.get("raw_query_string", "")
-        if raw_query_string:
-            path += "?" + raw_query_string
-        else:
-            # Fallback to parsed params (backward compatibility)
-            query_params = request_data.get("query_params", {})
-            if query_params:
-                # Handle both dict (old format) and list of tuples (new format for multi-value params)
-                if isinstance(query_params, dict):
-                    query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
-                else:
-                    # List of tuples format
-                    query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params])
-                path += query_str
+        
+        # Add query string if present
+        query_params = request_data.get("query_params", {})
+        if query_params:
+            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+            path += query_str
         
         if self.request_logger:
             # Log full details to file and get request ID
@@ -413,23 +403,15 @@ class TunnelClient:
             path = request_data.get("path", "/")
             headers = request_data.get("headers", {})
             query_params = request_data.get("query_params", {})
-            raw_query_string = request_data.get("raw_query_string", "")
             body = request_data.get("body", "")
-
-
+            
+            
             # Handle binary request body if present
             if request_data.get("is_binary") and body:
                 body = base64.b64decode(body)
-
-            # Build URL with raw query string if available, otherwise use params
-            if raw_query_string:
-                url = f"{self.local_url}{path}?{raw_query_string}"
-                # Don't pass params to avoid double encoding
-                query_params = None
-            else:
-                url = f"{self.local_url}{path}"
-                # Use parsed params (backward compatibility)
-
+            
+            url = f"{self.local_url}{path}"
+            
             async with httpx.AsyncClient() as client:
                 response = await client.request(
                     method=method,
