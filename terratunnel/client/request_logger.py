@@ -52,11 +52,11 @@ class RequestLogger:
         # Request details
         method = request_data.get("method", "GET")
         path = request_data.get("path", "/")
-        query_params = request_data.get("query_params", {})
+        query_params = request_data.get("query_params_multi", [])
 
         # Add query string if present
         if query_params:
-            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params])
             path += query_str
 
         log_lines.append(f"REQUEST: {method} {path}")
@@ -130,9 +130,9 @@ class RequestLogger:
         status_code = response_data.get("status_code", 0)
 
         # Add query string if present
-        query_params = request_data.get("query_params", {})
+        query_params = request_data.get("query_params_multi", [])
         if query_params:
-            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params])
             path += query_str
 
         # Format timestamp

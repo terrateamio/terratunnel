@@ -197,6 +197,7 @@ class TunnelClient:
             "path": request_data.get("path", "/"),
             "headers": request_data.get("headers", {}),
             "query_params": request_data.get("query_params", {}),
+            "query_params_multi": request_data.get("query_params_multi", []),
             "body": request_data.get("body", ""),
             "response_status": response_data.get("status_code", 0),
             "response_headers": response_data.get("headers", {}),
@@ -375,9 +376,9 @@ class TunnelClient:
         status_code = response_data.get("status_code", 0)
 
         # Add query string if present
-        query_params = request_data.get("query_params", {})
+        query_params = request_data.get("query_params_multi", [])
         if query_params:
-            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+            query_str = "?" + "&".join([f"{k}={v}" for k, v in query_params])
             path += query_str
 
         if self.request_logger:
@@ -402,7 +403,7 @@ class TunnelClient:
             method = request_data.get("method", "GET")
             path = request_data.get("path", "/")
             headers = request_data.get("headers", {})
-            query_params = request_data.get("query_params", {})
+            query_params = request_data.get("query_params_multi", [])
             body = request_data.get("body", "")
 
 
