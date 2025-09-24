@@ -2473,7 +2473,7 @@ async def proxy_request_streaming(request: Request, path: str):
         "path": f"/{path}" if path else "/",
         "headers": dict(request.headers),
         "query_params": dict(request.query_params),
-        "query_params_multi": list(request.query_params.items()),
+        "query_params_multi": list(request.query_params.multi_items()),
     }
 
     if body:
