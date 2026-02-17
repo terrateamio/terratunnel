@@ -46,7 +46,6 @@ primary_region = 'iad'
   [[services.ports]]
     port = 80
     handlers = ['http']
-    force_https = true
 
   [[services.ports]]
     port = 443
